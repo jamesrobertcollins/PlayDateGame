@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.14)
+set(CMAKE_C_STANDARD 11)
+
+set(ENVSDK $ENV{PLAYDATE_SDK_PATH})
+
+if (NOT ${ENVSDK} STREQUAL "")
+	file(TO_CMAKE_PATH ${ENVSDK} SDK)
+else()
+	message(FATAL_ERROR "Set PLAYDATE_SDK_PATH to your Playdate SDK folder")
+endif()
+
+if (NOT EXISTS ${SDK})
+	message(FATAL_ERROR "SDK Path not found: ${SDK}")
+endif()
+
+set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
+
+set(PLAYDATE_GAME_NAME Excavator)
+set(PLAYDATE_GAME_DEVICE Excavator_DEVICE)
+
+project(${PLAYDATE_GAME_NAME} C ASM)
+
+set(GAME_SOURCES src/main.c src/terrain.c)
+
+if (TOOLCHAIN STREQUAL "armgcc")
+	add_executable(${PLAYDATE_GAME_DEVICE} ${GAME_SOURCES})
+	target_link_libraries(${PLAYDATE_GAME_DEVICE} m)
+else()
+	add_library(${PLAYDATE_GAME_NAME} SHARED ${GAME_SOURCES})
+	if (NOT MSVC AND NOT APPLE)
+		target_link_libraries(${PLAYDATE_GAME_NAME} m)
+	endif()
+endif()
+
+include(${SDK}/C_API/buildsupport/playdate_game.cmake)

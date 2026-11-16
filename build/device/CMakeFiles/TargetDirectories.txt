@@ -1,0 +1,3 @@
+C:/GitHub/PlayDateGame/build/device/CMakeFiles/Excavator_DEVICE.dir
+C:/GitHub/PlayDateGame/build/device/CMakeFiles/edit_cache.dir
+C:/GitHub/PlayDateGame/build/device/CMakeFiles/rebuild_cache.dir

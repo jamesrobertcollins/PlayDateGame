@@ -1,0 +1,6 @@
+name=Excavator
+author=James
+description=First-person excavator sandbox. Dig, dump, and build ramps.
+bundleID=com.playdategame.excavator
+version=0.1
+buildNumber=1

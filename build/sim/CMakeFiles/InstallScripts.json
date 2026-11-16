@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/GitHub/PlayDateGame/build/sim/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
