@@ -1,5 +1,0 @@
-# ninja log v7
-7	242	8165679110489128	CMakeFiles/Excavator.dir/src/main.c.obj	7641e0a83dcd38b6
-11	359	8165679110529121	CMakeFiles/Excavator.dir/src/terrain.c.obj	f231da79746dbd98
-359	1326	8165679121402667	libExcavator.dll	8fcd84eecb871b3f
-359	1326	8165679121402667	libExcavator.dll.a	8fcd84eecb871b3f

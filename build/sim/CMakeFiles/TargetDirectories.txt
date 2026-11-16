@@ -1,3 +1,0 @@
-C:/GitHub/PlayDateGame/build/sim/CMakeFiles/Excavator.dir
-C:/GitHub/PlayDateGame/build/sim/CMakeFiles/edit_cache.dir
-C:/GitHub/PlayDateGame/build/sim/CMakeFiles/rebuild_cache.dir

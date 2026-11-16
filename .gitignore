@@ -1,0 +1,27 @@
+# Build output
+/build/
+/*.pdx/
+*.pdx
+
+# Compiled game code copied into Source/ by the build (rebuilt by build.ps1)
+/Source/pdex.dll
+/Source/pdex.dylib
+/Source/pdex.so
+/Source/pdex.elf
+/Source/pdex.bin
+
+# Playdate Simulator crash-reporter data, created in the working directory
+.sentry-native/
+
+# Playdate Simulator runtime data and logs
+*.log
+
+# Python bytecode (tools/)
+__pycache__/
+*.pyc
+
+# Local editor/OS files
+.vs/
+*.swp
+Thumbs.db
+.DS_Store
