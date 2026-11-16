@@ -88,10 +88,10 @@ Both are build products and are git-ignored.
 Source/            Lua game code and the pdxinfo metadata (this folder becomes the .pdx)
   main.lua         entry point: loading and saving, system menu, per-frame loop
   excavator.lua    body: driving, terrain following, tilt, slope limits, tipping
-  arm.lua          arm: crank/button input, kinematics, digging, dumping, arm drawing
+  arm.lua          arm: crank/button input, kinematics, digging, dumping, solid arm drawing with ground occlusion
   blade.lua        grade blade (B hold)
   view.lua         camera projection that matches the C renderer (for the arm overlay)
-  cab.lua          cab frame, dashboard HUD and short notices
+  cab.lua          cab frame, dashboard instruments and short notices
   settings.lua     the in-game Settings panel (terrain size, slumping, resets)
   radio.lua        the cab radio: built-in synth stations and your own audio files
   radiodata.lua    song data and the small note notation (plain Lua, testable on a PC)
@@ -103,6 +103,7 @@ src/               C extension (compiled into pdex.dll / pdex.bin)
 tools/
   hosttest.c       host-side test harness for the terrain core
   radiotest.lua    host-side checks of the radio song data
+  armtest.lua      host-side checks of the arm drawing (stubbed graphics)
   raw2png.py       converts the harness's raw 1-bit frames to PNG
 CMakeLists.txt     CMake project (used through build.ps1)
 build.ps1          build and test script
@@ -125,7 +126,15 @@ The renderer is a *voxel space* (Comanche style) raycaster:
 3. Camera pitch moves the horizon and roll shears it across the screen.
 4. Trees are billboards (three stacked cones on a trunk), sorted far to near and clipped against the terrain that was drawn in front of them.
 
-Quality adapts automatically: six levels trade horizontal resolution and view distance, and the controller drops a level quickly when the frame cost is too high and raises it slowly when there is headroom. The dashboard shows the current level (Q0-Q5) and frame rate.
+Quality adapts automatically: six levels trade horizontal resolution and view distance, and the controller drops a level quickly when the frame cost is too high and raises it slowly when there is headroom. The dashboard shows the current level (Q0-Q5) in its status box and the frame rate in the roof.
+
+### The arm and the cab
+
+The arm is drawn in Lua on top of the finished 3D frame, using the same camera as the renderer ([Source/view.lua](Source/view.lua)). It is built from solid shapes: tapered boxes for the boom and stick, a wedge-shaped bucket with side plates, a curved back, an open mouth and teeth, and hydraulic cylinders. Faces that point away from the camera are skipped, and the rest are filled with a dither shade by direction (top lightest) and outlined.
+
+**Ground occlusion.** The ground renderer remembers, for every screen column and distance step, how far down the screen the nearer terrain already reaches. After rendering, `terrain.occlusion` turns that into a 1-bit stencil for a given depth: pixels the nearer ground hides become black. The arm is drawn in three groups (boom, stick, bucket), each through the stencil for its own depth, so a bucket sunk into a pit disappears into it, and an arm behind a hill is hidden by the hill. This is approximate: each group uses one depth, so a very long part that crosses the ground can be clipped slightly early or late.
+
+The cab ([Source/cab.lua](Source/cab.lua)) is painted once into images (pillars, roof, dash housing, bezels) and just blitted each frame. Live parts are drawn on top: a speed LCD, BLADE and TILT lamps, boom/stick/arc and quality boxes, an attitude gauge, the radio station display, and two control levers that follow the buttons and the arm.
 
 ### Editing
 
@@ -154,7 +163,7 @@ The tracks are a rectangle whose four corners sample the ground. The average giv
 - saving and loading: the save is small, a save/load/save round trip is byte-identical, and stale (other size or seed), truncated, corrupt or missing files fall back to a clean field
 - all three terrain sizes generate and can be dug
 
-It also renders sample frames to `build/*.png` for a visual check and prints host render timings (which say nothing about device speed). If a `lua` interpreter is on the PATH it also runs `tools/radiotest.lua`, which checks that every station parses, uses defined voices, loops over whole bars and stays in a sensible note range.
+It also renders sample frames to `build/*.png` for a visual check and prints host render timings (which say nothing about device speed). If a `lua` interpreter is on the PATH it also runs two Lua checks. `tools/radiotest.lua` checks that every station parses, uses defined voices, loops over whole bars and stays in a sensible note range. `tools/armtest.lua` runs the real arm drawing code against stubbed graphics and checks that only camera-facing faces are drawn, that every group is drawn through a ground-occlusion stencil which is cleared afterwards, that an arm behind the camera draws nothing, and that no pose in a sweep of both arm schemes raises an error. The terrain tests also check the occlusion mask: a point behind a hill or buried below the surface is hidden, one above is visible.
 
 The Lua game code itself (menus, saving, radio playback, sounds) is checked by running it in the Playdate Simulator.
 
@@ -169,8 +178,8 @@ Other tunable constants live at the top of each file: machine speed, slope limit
 
 ## Known limitations
 
-- The arm is drawn over the scene, so a bucket below ground level still appears in front of it.
-- The bucket is a simple box and the cab is a plain frame.
+- Ground occlusion of the arm uses one depth per part group, so it is approximate near the surface (see above).
+- The cab art and the arm are simple 1-bit drawings and have only been judged on screenshots from the simulator.
 - Piles can look spiky with slumping off.
 - With slumping on you can't keep a deep narrow hole open, since the walls collapse to a stable angle (turn slumping off in Settings for trenches).
 - Radio stations from your own files are found when the game starts, so add them before launching. The menu list is fixed after that.
@@ -183,4 +192,5 @@ Other tunable constants live at the top of each file: machine speed, slope limit
 - [x] **Phase 2:** arm, dig and dump with limited bucket load
 - [x] **Phase 3:** grade blade, ramps, optional slumping
 - [x] **Phase 4:** system menu and settings (terrain size, resets, slumping, arm scheme, radio station), auto-save of terrain and position, and the cab radio
-- [ ] Next: tune on real hardware, occlude the arm against the ground, a nicer bucket and cab
+- [x] The arm is occluded by the ground, and has a modelled bucket, boom, stick and cylinders, with a fuller cab
+- [ ] Next: tune on real hardware (frame rate and sound), a rendered bucket full of dirt, and a nicer tree and sky look

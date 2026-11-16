@@ -63,3 +63,43 @@ function View.projectSegment(a, b)
 	local x2, y2, d2 = View.project(bx, by, bz)
 	return x1, y1, x2, y2, (d1 + d2) / 2
 end
+
+-- The camera position set by View.set (used to decide which faces of a solid face the viewer).
+function View.cameraPosition()
+	return camX, camY, camZ
+end
+
+-- Clips a polygon (a list of {x, y, z} world points) to the near plane and projects it.
+-- Returns a flat list of screen coordinates {x1, y1, x2, y2, ...} ready for fillPolygon, plus the
+-- polygon's mean depth and its screen bounds (minX, minY, maxX, maxY); or nil if nothing is left
+-- in front of the camera.
+function View.projectPolygon(points)
+	local n = #points
+	local kept = {}
+	for i = 1, n do
+		local a, b = points[i], points[i % n + 1]
+		local da, db = View.depth(a[1], a[2]), View.depth(b[1], b[2])
+		local aIn, bIn = da >= NEAR, db >= NEAR
+		if aIn then kept[#kept + 1] = a end
+		if aIn ~= bIn then
+			-- the edge crosses the near plane: keep the crossing point
+			local t = (NEAR - da) / (db - da)
+			kept[#kept + 1] = { a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t }
+		end
+	end
+	if #kept < 3 then return nil end
+
+	local flat, depthSum = {}, 0
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	for _, p in ipairs(kept) do
+		local sx, sy, d = View.project(p[1], p[2], p[3])
+		flat[#flat + 1] = sx
+		flat[#flat + 1] = sy
+		depthSum += d
+		if sx < minX then minX = sx end
+		if sx > maxX then maxX = sx end
+		if sy < minY then minY = sy end
+		if sy > maxY then maxY = sy end
+	end
+	return flat, depthSum / #kept, minX, minY, maxX, maxY
+end

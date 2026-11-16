@@ -17,8 +17,8 @@
   Launch the simulator with Excavator.pdx when the build finishes.
 .PARAMETER HostTest
   Do not build the game. Compile tools\hosttest.c with the terrain core, run its checks, run the
-  radio song data checks (tools\radiotest.lua, if a lua interpreter is on PATH) and convert the
-  frames the harness renders to build\*.png. Needs MSYS2 gcc and python with Pillow.
+  Lua checks (tools\radiotest.lua and tools\armtest.lua, if a lua interpreter is on PATH) and
+  convert the frames the harness renders to build\*.png. Needs MSYS2 gcc and python with Pillow.
 .PARAMETER Sdk
   Playdate SDK folder (also exported as PLAYDATE_SDK_PATH for CMake).
 .PARAMETER Msys
@@ -56,8 +56,9 @@ if ($HostTest) {
 		# song data checks need a standalone Lua interpreter; skip them (with a note) if absent
 		if (Get-Command lua -ErrorAction SilentlyContinue) {
 			Invoke-Native 'run radiotest' { lua tools\radiotest.lua }
+			Invoke-Native 'run armtest' { lua tools\armtest.lua }
 		} else {
-			Write-Host "lua not found: skipping tools\radiotest.lua (pacman -S mingw-w64-x86_64-lua)"
+			Write-Host "lua not found: skipping tools\radiotest.lua and tools\armtest.lua (pacman -S mingw-w64-x86_64-lua)"
 		}
 		$raws = Get-ChildItem build\*.raw | ForEach-Object { $_.FullName }
 		if ($raws) { python tools\raw2png.py @raws | Out-Null; Write-Host "Frames written to $out\*.png" }

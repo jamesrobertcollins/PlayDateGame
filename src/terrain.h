@@ -107,6 +107,14 @@ int terrain_slump_step(int budget);
 /* cam = {x, y, z, yaw, pitch, roll}. Draws the ground, sky and trees into a 1-bit frame buffer. */
 void terrain_render(uint8_t* frame, const float cam[6]);
 
+/* Ground occlusion, for drawing things (the excavator arm) over the finished frame.
+   After terrain_render, this fills the rectangle x0..x1, y0..y1 (inclusive, screen pixels) of a
+   1-bit stencil bitmap (same packing as the frame buffer, 1 = white): pixels that the nearer
+   ground hides from the camera at the given depth (meters along the view direction) become
+   black, the rest white. Pixels outside the rectangle are left alone. Used as a stencil image,
+   it lets Lua draw an object only where it is not buried behind or under terrain. */
+void terrain_occlusion_mask(uint8_t* data, int rowBytes, float depth, int x0, int y0, int x1, int y1);
+
 int terrain_get_quality(void);
 /* level >= 0 pins the quality; level < 0 returns to automatic adaptation. */
 void terrain_set_quality(int level);

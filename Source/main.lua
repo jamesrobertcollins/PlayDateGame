@@ -236,7 +236,7 @@ function playdate.update()
 	terrain.render(x, y, z, yaw, pitch, roll)
 	View.set(x, y, z, yaw, pitch, roll)
 	arm:draw(excavator)
-	Cab.draw(excavator, arm, blade)
+	Cab.draw(excavator, arm, blade, cfg.station)
 
 	if playdate.isCrankDocked() then
 		playdate.ui.crankIndicator:draw()

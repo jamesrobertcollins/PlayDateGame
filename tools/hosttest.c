@@ -297,6 +297,55 @@ static void test_persistence(void)
 	free(bad.data);
 }
 
+/* Row on screen of a point `depth` m ahead at height z, for a camera at height camZ pitched down
+   by `pitch` (the same projection terrain.c and Source/view.lua use). */
+static int proj_row(float depth, float z, float camZ, float pitch)
+{
+	float hor = SCREEN_H * 0.5f + 230.0f * tanf(pitch);
+	return (int)(hor - (z - camZ) * 230.0f / depth);
+}
+
+static int mask_white(const uint8_t* m, int x, int y)
+{
+	return (m[y * ROW_BYTES + (x >> 3)] >> (7 - (x & 7))) & 1;
+}
+
+static void test_occlusion(void)
+{
+	printf("ground occlusion mask\n");
+	const float camZ = 2.3f, pitch = -0.30f;
+	terrain_init(256, 31337u);
+	terrain_set_slumping(0);
+	float cx = terrain_world_size() * 0.5f, cy = cx;
+	/* a hill centred 10 m ahead, up to 2 m high (below eye height) */
+	for (int k = 0; k < 120; k++) terrain_dump(cx + 10.0f, cy, 2.0f, 1.6f, 0.05f);
+
+	const float cam[6] = { cx, cy, camZ, 0.0f, pitch, 0.0f };
+	terrain_set_quality(2);
+	memset(g_frame, 0, sizeof g_frame);
+	terrain_render(g_frame, cam);
+
+	static uint8_t m[ROW_BYTES * SCREEN_H];
+	memset(m, 0xFF, sizeof m);
+	terrain_occlusion_mask(m, ROW_BYTES, 16.0f, 190, 0, 210, SCREEN_H - 1);
+	int behind = proj_row(16.0f, 0.0f, camZ, pitch); /* ground level behind the hill */
+	int above = proj_row(16.0f, 3.5f, camZ, pitch);  /* clear of the hill's top */
+	CHECK(!mask_white(m, 200, behind), "ground-level point behind the hill is hidden (row %d)", behind);
+	CHECK(mask_white(m, 200, above), "a point above the hilltop stays visible (row %d)", above);
+
+	memset(m, 0xFF, sizeof m);
+	terrain_occlusion_mask(m, ROW_BYTES, 5.0f, 190, 0, 210, SCREEN_H - 1);
+	int clear = proj_row(5.0f, 1.5f, camZ, pitch);   /* above the rolling ground (about +-0.9 m) */
+	int buried = proj_row(5.0f, -1.5f, camZ, pitch); /* below the surface at its own depth */
+	CHECK(mask_white(m, 200, clear), "a point above the ground is visible (row %d)", clear);
+	CHECK(!mask_white(m, 200, buried), "a point buried below the ground is hidden (row %d)", buried);
+	CHECK(mask_white(m, 5, buried) && mask_white(m, 395, 0), "pixels outside the rectangle are untouched");
+
+	memset(m, 0x00, sizeof m);
+	terrain_occlusion_mask(m, ROW_BYTES, 500.0f, 190, 0, 210, 239);
+	CHECK(mask_white(m, 200, 239) && mask_white(m, 200, 0), "beyond the rendered range nothing is hidden");
+}
+
 static void test_sizes(void)
 {
 	printf("terrain sizes\n");
@@ -329,6 +378,7 @@ int main(int argc, char** argv)
 	terrain_init(size, 4242u);
 	test_grade();
 	test_persistence();
+	test_occlusion();
 	test_sizes();
 
 	printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);

@@ -11,6 +11,7 @@
  *   terrain.worldSize()                     -> field size in meters
  *   terrain.height(x, y)                    -> ground height
  *   terrain.render(x, y, z, yaw, pitch, roll)
+ *   terrain.occlusion(image, depth, x0, y0, x1, y1)  fills a stencil: what ground hides at `depth`
  *   terrain.dig(x, y, tipZ, radius, maxVol) -> volume removed
  *   terrain.dump(x, y, topZ, radius, vol)   -> volume deposited
  *   terrain.grade(cx, cy, yaw, halfLen, halfWid, blend)
@@ -201,6 +202,26 @@ static int l_render(lua_State* L)
 	return 0;
 }
 
+/* terrain.occlusion(image, depth, x0, y0, x1, y1)
+   Fills part of a 400x240 stencil image with the ground-occlusion mask for `depth` meters (see
+   terrain_occlusion_mask). The image must be a plain 1-bit white image from
+   playdate.graphics.image.new(400, 240, playdate.graphics.kColorWhite). */
+static int l_occlusion(lua_State* L)
+{
+	(void)L;
+	LCDBitmap* bmp = pd->lua->getBitmap(1);
+	float depth = pd->lua->getArgFloat(2);
+	int x0 = pd->lua->getArgInt(3), y0 = pd->lua->getArgInt(4);
+	int x1 = pd->lua->getArgInt(5), y1 = pd->lua->getArgInt(6);
+	int w, h, rowBytes;
+	uint8_t *mask, *data;
+	if (!bmp) return 0;
+	pd->graphics->getBitmapData(bmp, &w, &h, &rowBytes, &mask, &data);
+	if (w != SCREEN_W || h != SCREEN_H || !data) return 0;
+	terrain_occlusion_mask(data, rowBytes, depth, x0, y0, x1, y1);
+	return 0;
+}
+
 /* terrain.setQuality(level) -- level < 0 selects automatic adaptation */
 static int l_setQuality(lua_State* L)
 {
@@ -247,6 +268,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		reg(l_load, "terrain.load");
 		reg(l_dirty, "terrain.dirty");
 		reg(l_render, "terrain.render");
+		reg(l_occlusion, "terrain.occlusion");
 		reg(l_setQuality, "terrain.setQuality");
 		reg(l_quality, "terrain.quality");
 	}

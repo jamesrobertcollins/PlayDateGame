@@ -1,7 +1,8 @@
 -- arm.lua
 --
 -- The excavator arm: turns crank and A/B input into joint angles, runs the bucket (curl steps,
--- dump), digs and dumps through the terrain engine, and draws the arm in perspective.
+-- dump), digs and dumps through the terrain engine, and draws the arm in perspective (solid
+-- shapes with face shading, hydraulic cylinders, and occlusion against the ground).
 --
 -- Input
 --   crank   sets the arm position directly (absolute), with eased end stops
@@ -212,84 +213,244 @@ function Arm:update(dt, ex)
 	self.prevTip = { tx, ty, tz }
 end
 
--- Draws a boom or stick as a thick black line with a white outline. The width shrinks with depth
--- so near parts of the arm look bigger.
-local function drawBeam(a, b, width)
-	local x1, y1, x2, y2, depth = View.projectSegment(a, b)
+-- ---------------------------------------------------------------------------------------------
+-- Drawing
+-- ---------------------------------------------------------------------------------------------
+--
+-- The arm is built from solid shapes (tapered boxes for the boom and stick, a convex wedge for the
+-- bucket) placed in the world with the body's pose, so they are projected with exactly the same
+-- camera as the ground. Each shape is split into faces; back-facing faces are skipped and the rest
+-- are filled with a dither shade and outlined. The parts are drawn in three groups (boom, stick,
+-- bucket). Each group goes through a stencil that hides the pixels the ground in front of it
+-- covers (terrain.occlusion, see src/terrain.c), so a bucket sunk into a pit disappears into it
+-- instead of floating over the ground.
+
+local BAYER <const> = gfx.image.kDitherTypeBayer8x8
+
+local stencil = nil -- 400x240 white image that terrain.occlusion fills for each group
+
+-- Link dimensions: half widths and thicknesses at each end (meters).
+local BOOM_HALF_W, BOOM_T0, BOOM_T1 = 0.30, 0.55, 0.40
+local STICK_HALF_W, STICK_T0, STICK_T1 = 0.22, 0.38, 0.28
+
+-- Face shades as black coverage (0 = white, 1 = black): top, bottom, left side, right side. Dark
+-- enough to stand out from the light grass, with the top face still the brightest.
+local BOX_SHADES <const> = { 0.45, 0.88, 0.62, 0.74 }
+-- Which corners make up each face of a link box (see linkCorners for the corner numbering).
+local BOX_FACES <const> = { { 1, 2, 6, 5 }, { 3, 4, 8, 7 }, { 4, 1, 5, 8 }, { 2, 3, 7, 6 } }
+
+-- The bucket's side profile in its own frame: x along the bucket axis (towards the tip), y
+-- perpendicular to it (negative towards the heel). Convex, so face culling works on it.
+-- Points: pivot, two points on the curved back, tip, heel, rear.
+local PROFILE <const> = { { 0, 0 }, { 0.32, 0.10 }, { 0.65, 0.09 }, { 0.90, 0 }, { -0.095, -0.54 }, { -0.14, -0.22 } }
+local BUCKET_EDGE_SHADES <const> = { 0.55, 0.55, 0.62, false, 0.88, 0.78 } -- false = the open mouth
+local BUCKET_PLATE_SHADE <const> = 0.65
+local TEETH <const> = 4
+
+-- Body-plane point {f, u} on the link a-b: fraction s along it, offset off to its "up" side.
+local function onLink(a, b, s, off)
+	local df, du = b[1] - a[1], b[2] - a[2]
+	local len = math.sqrt(df * df + du * du)
+	return { a[1] + df * s - du / len * off, a[2] + du * s + df / len * off }
+end
+
+-- A group collects the draw operations of several parts plus their combined screen bounds and
+-- mean depth, which select the occlusion stencil.
+local function newGroup()
+	return { recs = {}, dsum = 0, dn = 0, x0 = math.huge, y0 = math.huge, x1 = -math.huge, y1 = -math.huge }
+end
+
+local function grow(g, d, x0, y0, x1, y1)
+	g.dsum += d
+	g.dn += 1
+	if x0 < g.x0 then g.x0 = x0 end
+	if y0 < g.y0 then g.y0 = y0 end
+	if x1 > g.x1 then g.x1 = x1 end
+	if y1 > g.y1 then g.y1 = y1 end
+end
+
+-- Adds a world-space polygon (list of {x, y, z}) filled with the given black coverage.
+local function addPoly(g, points, shade)
+	local flat, d, x0, y0, x1, y1 = View.projectPolygon(points)
+	if not flat then return end
+	g.recs[#g.recs + 1] = { flat = flat, shade = shade }
+	grow(g, d, x0, y0, x1, y1)
+end
+
+-- Adds a thick line between two world points; width is in meters at the line's depth.
+local function addLine(g, a, b, width)
+	local x1, y1, x2, y2, d = View.projectSegment(a, b)
 	if not x1 then return end
-	local px = clamp(math.floor(width * View.FOCAL / depth), 3, 44)
-	gfx.setColor(gfx.kColorWhite)
-	gfx.setLineWidth(px + 3)
-	gfx.drawLine(x1, y1, x2, y2)
-	gfx.setColor(gfx.kColorBlack)
-	gfx.setLineWidth(px)
-	gfx.drawLine(x1, y1, x2, y2)
+	local px = clamp(math.floor(width * View.FOCAL / d), 2, 9)
+	g.recs[#g.recs + 1] = { line = { x1, y1, x2, y2 }, width = px }
+	grow(g, d, math.min(x1, x2) - px, math.min(y1, y2) - px, math.max(x1, x2) + px, math.max(y1, y2) + px)
+end
+
+local function addDot(g, p, radius)
+	if View.depth(p[1], p[2]) < View.NEAR then return end
+	local sx, sy, d = View.project(p[1], p[2], p[3])
+	g.recs[#g.recs + 1] = { dot = { sx, sy }, radius = radius }
+	grow(g, d, sx - radius, sy - radius, sx + radius, sy + radius)
+end
+
+-- True if a face of a convex solid points towards the camera. The face normal comes from its
+-- first three points and is flipped to point away from the solid's centre `c`.
+local function facesCamera(pts, c)
+	local a, b, p3 = pts[1], pts[2], pts[3]
+	local ux, uy, uz = b[1] - a[1], b[2] - a[2], b[3] - a[3]
+	local vx, vy, vz = p3[1] - a[1], p3[2] - a[2], p3[3] - a[3]
+	local nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+	local fx, fy, fz = 0, 0, 0
+	for _, p in ipairs(pts) do
+		fx += p[1]; fy += p[2]; fz += p[3]
+	end
+	fx, fy, fz = fx / #pts, fy / #pts, fz / #pts
+	if nx * (fx - c[1]) + ny * (fy - c[2]) + nz * (fz - c[3]) < 0 then
+		nx, ny, nz = -nx, -ny, -nz
+	end
+	local camX, camY, camZ = View.cameraPosition()
+	return nx * (camX - fx) + ny * (camY - fy) + nz * (camZ - fz) > 0
+end
+
+local function centreOf(points)
+	local x, y, z = 0, 0, 0
+	for _, p in ipairs(points) do
+		x += p[1]; y += p[2]; z += p[3]
+	end
+	return { x / #points, y / #points, z / #points }
+end
+
+-- World corners of a tapered link box from body-plane point a to b: thickness ta at a and tb at
+-- b, half width w. Corners 1-4 are at a (top +l, top -l, bottom -l, bottom +l), 5-8 the same at b.
+local function linkCorners(ex, a, b, ta, tb, w)
+	local df, du = b[1] - a[1], b[2] - a[2]
+	local len = math.sqrt(df * df + du * du)
+	local nf, nu = -du / len, df / len
+	local function corner(pt, t, side, l)
+		return { toWorld(ex, pt[1] + nf * t * side / 2, l, pt[2] + nu * t * side / 2) }
+	end
+	return {
+		corner(a, ta, 1, w), corner(a, ta, 1, -w), corner(a, ta, -1, -w), corner(a, ta, -1, w),
+		corner(b, tb, 1, w), corner(b, tb, 1, -w), corner(b, tb, -1, -w), corner(b, tb, -1, w),
+	}
+end
+
+local function addBox(g, corners)
+	local c = centreOf(corners)
+	for i, f in ipairs(BOX_FACES) do
+		local face = { corners[f[1]], corners[f[2]], corners[f[3]], corners[f[4]] }
+		if facesCamera(face, c) then addPoly(g, face, BOX_SHADES[i]) end
+	end
+end
+
+-- Draws a group's operations through the ground-occlusion stencil.
+local function drawGroup(g)
+	if #g.recs == 0 then return end
+	stencil = stencil or gfx.image.new(400, 240, gfx.kColorWhite)
+	terrain.occlusion(stencil, g.dsum / g.dn,
+		math.floor(g.x0) - 4, math.floor(g.y0) - 4, math.ceil(g.x1) + 4, math.ceil(g.y1) + 4)
+	gfx.setStencilImage(stencil)
+
+	for _, r in ipairs(g.recs) do
+		if r.flat then
+			gfx.setColor(gfx.kColorWhite)
+			gfx.fillPolygon(table.unpack(r.flat))
+			if r.shade > 0 then
+				gfx.setColor(gfx.kColorBlack)
+				-- the dither value is how transparent the fill is (measured on SDK 3.1.2: 0.1 is
+				-- nearly solid, 0.9 nearly clear), so black coverage `shade` is 1 - shade
+				gfx.setDitherPattern(1 - r.shade, BAYER)
+				gfx.fillPolygon(table.unpack(r.flat))
+			end
+			gfx.setColor(gfx.kColorBlack)
+			gfx.drawPolygon(table.unpack(r.flat))
+		elseif r.line then
+			-- a hydraulic cylinder: dark body with a bright rod down the middle
+			local l = r.line
+			gfx.setColor(gfx.kColorBlack)
+			gfx.setLineWidth(r.width)
+			gfx.drawLine(l[1], l[2], l[3], l[4])
+			if r.width >= 4 then
+				gfx.setColor(gfx.kColorWhite)
+				gfx.setLineWidth(math.max(1, r.width // 3))
+				gfx.drawLine(l[1], l[2], l[3], l[4])
+			end
+		else
+			gfx.setColor(gfx.kColorBlack)
+			gfx.fillCircleAtPoint(r.dot[1], r.dot[2], r.radius)
+		end
+	end
+
 	gfx.setLineWidth(1)
+	gfx.clearStencil()
+	gfx.setColor(gfx.kColorBlack)
 end
 
--- Projects four world points to a flat list of screen coordinates for fillPolygon, or nil if any
--- point is behind the near plane (such a quad is skipped rather than clipped).
-local function projectQuad(p1, p2, p3, p4)
-	local pts = {}
-	for _, p in ipairs({ p1, p2, p3, p4 }) do
-		if View.depth(p[1], p[2]) < View.NEAR then return nil end
-		local sx, sy = View.project(p[1], p[2], p[3])
-		pts[#pts + 1] = sx
-		pts[#pts + 1] = sy
-	end
-	return pts
-end
-
-local function fillQuad(pts, outline)
-	gfx.setColor(gfx.kColorWhite)
-	gfx.fillPolygon(table.unpack(pts))
-	if outline then
-		gfx.setColor(gfx.kColorBlack)
-		gfx.setLineWidth(2)
-		gfx.drawPolygon(table.unpack(pts))
-		gfx.setLineWidth(1)
-	end
-end
-
--- Draws boom, stick, bucket and any falling dirt over the 3D view.
+-- Draws boom, stick, bucket, cylinders and any falling dirt over the 3D view.
 function Arm:draw(ex)
-	local p0, p1, p2, tip, heel = self:localPoints()
-	local function w(p, l) return { toWorld(ex, p[1], l or 0, p[2]) } end
+	local p0, p1, p2, tip = self:localPoints()
+	local function world(p, l) return { toWorld(ex, p[1], l or 0, p[2]) } end
 
-	drawBeam(w(p0), w(p1), 0.55)
-	drawBeam(w(p1), w(p2), 0.42)
+	-- boom: a tapered box with the boom cylinder running from the body up onto it
+	local boom = newGroup()
+	addBox(boom, linkCorners(ex, p0, p1, BOOM_T0, BOOM_T1, BOOM_HALF_W))
+	addLine(boom, world({ PIVOT_F - 0.45, PIVOT_U + 0.45 }), world(onLink(p0, p1, 0.34, BOOM_T0 / 2 + 0.06)), 0.14)
 
+	-- stick, with the stick cylinder from the top of the boom
+	local stick = newGroup()
+	addBox(stick, linkCorners(ex, p1, p2, STICK_T0, STICK_T1, STICK_HALF_W))
+	addLine(stick, world(onLink(p0, p1, 0.66, BOOM_T1 / 2 + 0.08)), world(onLink(p1, p2, 0.22, STICK_T0 / 2 + 0.06)), 0.11)
+
+	-- bucket: side plates, curved back, open mouth and teeth, plus its cylinder
+	local bucket = newGroup()
+	local a3 = math.atan(tip[2] - p2[2], tip[1] - p2[1])
+	local ca, sa = math.cos(a3), math.sin(a3)
+	local function bpt(x, y, l)
+		return { toWorld(ex, p2[1] + x * ca - y * sa, l, p2[2] + x * sa + y * ca) }
+	end
 	local hw = BUCKET_HALF_WIDTH
-	-- the bucket's outer shell (black) first, then its open mouth on top
-	local shell = projectQuad(w(p2, hw), w(tip, hw), w(tip, -hw), w(p2, -hw))
-	if shell then
-		gfx.setColor(gfx.kColorBlack)
-		gfx.fillPolygon(table.unpack(shell))
-		gfx.setColor(gfx.kColorWhite)
-		gfx.setLineWidth(1)
-		gfx.drawPolygon(table.unpack(shell))
+	local left, right = {}, {}
+	for i, pr in ipairs(PROFILE) do
+		left[i] = bpt(pr[1], pr[2], hw)
+		right[i] = bpt(pr[1], pr[2], -hw)
 	end
-	local mouth = projectQuad(w(heel, hw), w(tip, hw), w(tip, -hw), w(heel, -hw))
-	if mouth then
-		fillQuad(mouth, true)
-		-- with black selected the dither alpha is black coverage: light when empty, dark when full
-		gfx.setColor(gfx.kColorBlack)
-		gfx.setDitherPattern(0.2 + 0.6 * self.load / CAPACITY, gfx.image.kDitherTypeBayer8x8)
-		gfx.fillPolygon(table.unpack(mouth))
-		gfx.setColor(gfx.kColorBlack)
+	local all = {}
+	for i = 1, #PROFILE do
+		all[#all + 1] = left[i]
+		all[#all + 1] = right[i]
 	end
+	local c = centreOf(all)
+
+	if facesCamera(left, c) then addPoly(bucket, left, BUCKET_PLATE_SHADE) end
+	if facesCamera(right, c) then addPoly(bucket, right, BUCKET_PLATE_SHADE) end
+	for i = 1, #PROFILE do
+		local j = i % #PROFILE + 1
+		local face = { left[i], left[j], right[j], right[i] }
+		if facesCamera(face, c) then
+			local shade = BUCKET_EDGE_SHADES[i]
+			if shade == false then
+				-- the open mouth: a dark cavity when empty, dirt-coloured when loaded
+				shade = 0.88 - 0.38 * math.min(1, self.load / CAPACITY)
+			end
+			addPoly(bucket, face, shade)
+		end
+	end
+	for k = 1, TEETH do
+		local l = -hw + (k - 0.5) * (2 * hw / TEETH)
+		addPoly(bucket, { bpt(0.90, 0, l - 0.07), bpt(0.90, 0, l + 0.07), bpt(1.08, -0.04, l) }, 1)
+	end
+	addLine(bucket, world(onLink(p1, p2, 0.74, STICK_T1 / 2 + 0.07)), bpt(0.28, 0.12, 0), 0.10)
 
 	-- a few falling specks under the bucket while it is spilling
 	if self.dumping and self.bucketAngle >= DUMP_THRESHOLD and self.load > 0 then
-		gfx.setColor(gfx.kColorBlack)
 		for k = 1, 6 do
 			local jitter = ((self.clock * 9 + k * 1.7) % 1) - 0.5
-			local x, y, z = self.tip[1], self.tip[2], self.tip[3] - k * 0.35 - (self.clock * 6 % 0.35)
-			if View.depth(x, y) >= View.NEAR then
-				local sx, sy = View.project(x, y, z)
-				gfx.fillCircleAtPoint(sx + jitter * 8, sy, 2)
-			end
+			addDot(bucket, { self.tip[1] + jitter * 0.3, self.tip[2], self.tip[3] - k * 0.35 - (self.clock * 6 % 0.35) },
+				2)
 		end
 	end
-	gfx.setColor(gfx.kColorBlack)
+
+	drawGroup(boom)
+	drawGroup(stick)
+	drawGroup(bucket)
 end

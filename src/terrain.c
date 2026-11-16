@@ -1008,7 +1008,7 @@ void terrain_render(uint8_t* fb, const float cam[6])
 	vw.rollK = tanf(cam[5]);
 	vw.step = step;
 
-	const int recordHist = g_ntrees > 0;
+	const int recordHist = 1; /* trees and terrain_occlusion_mask both read the per-column history */
 	const float invFocal = 1.0f / FOCAL;
 
 	for (int col = 0; col < SCREEN_W; col += step) {
@@ -1061,4 +1061,42 @@ void terrain_render(uint8_t* fb, const float cam[6])
 	}
 
 	if (recordHist) draw_trees(fb, &vw, QL[g_q].maxDist);
+}
+
+/* For each column the renderer kept, per ray step, the row the ground drawn so far reaches down
+   from (s_hist). A point at depth d is hidden if its row is at or below that value for the
+   first step at or beyond d: the ground nearer than the point has already covered that row.
+   One step further (+1) is used so something sunk below the surface at its own depth counts as
+   buried, which is what makes a bucket disappear into the pit it is digging. */
+void terrain_occlusion_mask(uint8_t* data, int rowBytes, float depth, int x0, int y0, int x1, int y1)
+{
+	if (!data) return;
+	if (x0 < 0) x0 = 0;
+	if (y0 < 0) y0 = 0;
+	if (x1 > SCREEN_W - 1) x1 = SCREEN_W - 1;
+	if (y1 > SCREEN_H - 1) y1 = SCREEN_H - 1;
+	if (x0 > x1 || y0 > y1) return;
+
+	/* no usable history (nothing rendered yet) or beyond the rendered range: nothing is hidden */
+	int si = -1;
+	if (g_cells && s_builtQ == g_q && s_steps > 0 && depth < s_T[s_steps - 1]) {
+		int lo = 0, hi = s_steps;
+		while (lo < hi) {
+			int mid = (lo + hi) >> 1;
+			if (s_T[mid] < depth) lo = mid + 1; else hi = mid;
+		}
+		si = lo + 1 < s_steps ? lo + 1 : lo;
+	}
+
+	const int step = QL[g_q].colStep;
+	for (int x = x0; x <= x1; x++) {
+		/* history exists only for the columns that were drawn (every `step`th) */
+		int cut = si < 0 ? SCREEN_H : s_hist[(x & ~(step - 1)) * MAXSTEPS + si];
+		const uint8_t bit = (uint8_t)(0x80 >> (x & 7));
+		uint8_t* p = data + y0 * rowBytes + (x >> 3);
+		for (int y = y0; y <= y1; y++) {
+			if (y < cut) *p |= bit; else *p &= (uint8_t)~bit;
+			p += rowBytes;
+		}
+	}
 }
