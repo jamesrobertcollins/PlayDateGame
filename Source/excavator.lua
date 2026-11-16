@@ -1,35 +1,44 @@
--- Excavator body: driving, terrain following, tilt and tipping.
+-- excavator.lua
+--
+-- The excavator body: driving, following the terrain, tilting with it, slope limits and
+-- tipping over. The arm is separate (arm.lua) and the camera is derived from this pose.
+--
+-- Controls: Left/Right turn the body, Up/Down drive forwards and backwards.
 
 Excavator = {}
 Excavator.__index = Excavator
 
+-- The tracks are modelled as a rectangle; ground height is sampled at its four corners.
 local TRACK_LEN, TRACK_GAUGE = 3.4, 2.6
-local MAX_SPEED, ACCEL = 3.5, 7.0
-local TURN_RATE = 1.1
-local EYE_HEIGHT = 2.3
-local EYE_FORWARD = 0.5
-local EYE_LEFT = 0.7
-local CAM_PITCH = -0.30
+local MAX_SPEED, ACCEL = 3.5, 7.0   -- m/s and m/s^2
+local TURN_RATE = 1.1               -- rad/s
+local EYE_HEIGHT = 2.3              -- camera height above the body's ground height
+local EYE_FORWARD = 0.5             -- camera offset along the heading
+local EYE_LEFT = 0.7                -- camera offset to the left, so the arm shows right of centre
+local CAM_PITCH = -0.30             -- the camera looks slightly down
 
 -- Slope rules (radians)
 local CLIMB_MAX = math.rad(32)  -- steeper uphill is blocked
 local ROLL_BLOCK = math.rad(38) -- driving onto a steeper side slope is blocked
 local TIP_PITCH = math.rad(48)  -- nose/tail-down beyond this tips the machine
 local TIP_ROLL = math.rad(44)
-Excavator.WARN_FRACTION = 0.7
+Excavator.WARN_FRACTION = 0.7   -- the HUD warns once the tilt reaches this fraction of tipping
 
 local EDGE_MARGIN = 10.0 -- keeps the machine out of the tree band
 
+-- Samples the ground under the four track corners for a body at (x, y) facing yaw.
+-- Returns the average height and the body's pitch and roll (positive roll = right side down).
 local function samplePose(x, y, yaw)
 	local c, s = math.cos(yaw), math.sin(yaw)
 	local hl, hw = TRACK_LEN / 2, TRACK_GAUGE / 2
+	-- height at (f forward, l left) relative to the body centre
 	local function h(f, l)
 		return terrain.height(x + c * f - s * l, y + s * f + c * l)
 	end
 	local fl, fr, bl, br = h(hl, hw), h(hl, -hw), h(-hl, hw), h(-hl, -hw)
 	local z = (fl + fr + bl + br) / 4
 	local pitch = math.atan((fl + fr - bl - br) / 2, TRACK_LEN)
-	local roll = math.atan((fl + bl - fr - br) / 2, TRACK_GAUGE) -- positive: right side down
+	local roll = math.atan((fl + bl - fr - br) / 2, TRACK_GAUGE)
 	return z, pitch, roll
 end
 
@@ -39,6 +48,7 @@ function Excavator.new()
 	return self
 end
 
+-- Puts the machine back in the middle of the field, upright.
 function Excavator:reset()
 	local world = terrain.worldSize()
 	self.x, self.y = world / 2, world / 2
@@ -46,6 +56,7 @@ function Excavator:reset()
 	self.speed = 0
 	self.tipped = false
 	self.z, self.pitch, self.roll = samplePose(self.x, self.y, self.yaw)
+	-- v* are smoothed copies used only for drawing, so bumpy ground doesn't jolt the camera
 	self.vz, self.vpitch, self.vroll = self.z, self.pitch, self.roll
 end
 
@@ -63,6 +74,7 @@ function Excavator:update(dt)
 
 	self.yaw += turn * TURN_RATE * dt
 
+	-- speed accelerates towards the commanded value rather than jumping to it
 	local target = drive * MAX_SPEED
 	if self.speed < target then
 		self.speed = math.min(target, self.speed + ACCEL * dt)
@@ -70,6 +82,7 @@ function Excavator:update(dt)
 		self.speed = math.max(target, self.speed - ACCEL * dt)
 	end
 
+	-- propose the next position, keep it inside the field, and test the slope there
 	local world = terrain.worldSize()
 	local nx = self.x + math.cos(self.yaw) * self.speed * dt
 	local ny = self.y + math.sin(self.yaw) * self.speed * dt
@@ -93,6 +106,7 @@ function Excavator:update(dt)
 		self.speed = 0
 	end
 
+	-- ease the drawn pose towards the true pose (about 8 per second)
 	local k = math.min(1, dt * 8)
 	self.vz += (self.z - self.vz) * k
 	self.vpitch += (self.pitch - self.vpitch) * k
@@ -104,9 +118,9 @@ function Excavator:tiltRatio()
 	return math.max(math.abs(self.pitch) / TIP_PITCH, math.abs(self.roll) / TIP_ROLL)
 end
 
+-- Camera for terrain.render: x, y, z, yaw, pitch, roll.
 function Excavator:camera()
 	local c, s = math.cos(self.yaw), math.sin(self.yaw)
-	-- the cab sits left of the arm's centre line, so the arm shows up right of centre
 	return self.x + c * EYE_FORWARD - s * EYE_LEFT, self.y + s * EYE_FORWARD + c * EYE_LEFT,
 		self.vz + EYE_HEIGHT, self.yaw, self.vpitch + CAM_PITCH, self.vroll
 end

@@ -1,15 +1,19 @@
--- Cab frame and dashboard HUD drawn over the 3D view.
+-- cab.lua
+--
+-- The cab frame and dashboard HUD drawn over the 3D view: window pillars, speed, the active
+-- crank joint, the blade indicator, a tilt gauge with a tipping warning, the render quality and
+-- frame rate (handy while tuning for the device), and the "tipped over" prompt.
 
 local gfx <const> = playdate.graphics
 
 Cab = {}
 
-local DASH_Y = 212
+local DASH_Y = 212 -- top of the dashboard strip
 
+-- Artificial-horizon style gauge: a line that rotates with roll and shifts with pitch.
 local function drawTiltGauge(cx, cy, ex)
 	gfx.setColor(gfx.kColorWhite)
 	gfx.drawCircleAtPoint(cx, cy, 11)
-	-- horizon line rotated by roll, shifted by pitch
 	local r = ex.roll
 	local off = math.max(-8, math.min(8, -ex.pitch * 14))
 	local dx, dy = math.cos(r) * 10, math.sin(r) * 10
@@ -17,7 +21,8 @@ local function drawTiltGauge(cx, cy, ex)
 	gfx.fillCircleAtPoint(cx, cy, 1)
 end
 
-function Cab.draw(ex, arm)
+function Cab.draw(ex, arm, blade)
+	-- roof bar, two window pillars and the dashboard
 	gfx.setColor(gfx.kColorBlack)
 	gfx.fillRect(0, 0, 400, 10)
 	gfx.fillPolygon(0, 0, 26, 0, 12, DASH_Y, 0, DASH_Y)
@@ -26,16 +31,21 @@ function Cab.draw(ex, arm)
 	gfx.setColor(gfx.kColorWhite)
 	gfx.drawLine(12, DASH_Y, 388, DASH_Y)
 
+	-- dashboard text is white on black
 	gfx.setImageDrawMode(gfx.kDrawModeFillWhite)
 	gfx.drawText(string.format("%.1f m/s", math.abs(ex.speed)), 20, DASH_Y + 6)
 	if arm.scheme == Arm.SCHEME_JOINTS then
 		gfx.drawText(arm.active == 1 and "Crank: BOOM" or "Crank: STICK", 80, DASH_Y + 6)
+	end
+	if blade.active then
+		gfx.drawText("BLADE", 232, DASH_Y + 6)
 	end
 	gfx.drawText(string.format("Q%d  %dfps", terrain.quality(), playdate.getFPS()), 300, DASH_Y + 6)
 	gfx.setImageDrawMode(gfx.kDrawModeCopy)
 
 	drawTiltGauge(200, DASH_Y + 14, ex)
 
+	-- blinking warning as the machine nears its tipping angle
 	if not ex.tipped and ex:tiltRatio() > Excavator.WARN_FRACTION then
 		if (playdate.getCurrentTimeMilliseconds() // 250) % 2 == 0 then
 			gfx.setImageDrawMode(gfx.kDrawModeFillWhite)

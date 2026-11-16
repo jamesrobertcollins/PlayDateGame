@@ -1,18 +1,38 @@
+/*
+ * terrain.c - heightfield terrain: generation, editing and the voxel-space renderer.
+ *
+ * Layout of this file:
+ *   1. constants, quality levels and module state
+ *   2. small helpers (hash noise, dither table, per-cell shading)
+ *   3. generation (terrain_init, tree placement)
+ *   4. editing (dig, dump, grade blade, slumping) and the shading/slump work queues
+ *   5. adaptive quality
+ *   6. the renderer (ground columns, sky, billboard trees)
+ */
 #include "terrain.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define FOCAL 230.0f
-#define NEAR_T 2.0f
-#define BILINEAR_DIST 22.0f
-#define MAXSTEPS 256
-#define FOG_V 238
+/* ------------------------------------------------------------------------------------------ */
+/* 1. Constants and state                                                                      */
+/* ------------------------------------------------------------------------------------------ */
+
+#define FOCAL 230.0f          /* focal length in pixels; must match FOCAL in Source/view.lua */
+#define NEAR_T 2.0f           /* closest ray distance rendered, meters */
+#define BILINEAR_DIST 22.0f   /* inside this distance ground height is interpolated, else nearest */
+#define MAXSTEPS 256          /* upper bound on ray steps per column */
+#define FOG_V 238             /* brightness distant terrain fades towards (matches the sky) */
 #define MAX_TREES 2048
-#define MAX_VISIBLE 512
-#define ADAPT_HIGH_MS 22.0f
-#define ADAPT_LOW_MS 13.0f
+#define MAX_VISIBLE 512       /* trees drawn per frame */
+#define ADAPT_HIGH_MS 22.0f   /* above this average frame cost, drop quality */
+#define ADAPT_LOW_MS 13.0f    /* below this, quality may rise */
+
+#define SLUMP_QUEUE_CAP 8192  /* cells waiting to be relaxed */
+#define SHADE_LIST_CAP 2048   /* cells waiting to be re-lit */
+#define F_QUEUED 1            /* per-cell flag: already in the slump queue */
+#define F_SHADE 2             /* per-cell flag: already in the shade list */
 
 void* (*terrain_realloc)(void*, size_t) = realloc;
 
@@ -22,6 +42,8 @@ typedef struct {
 	int16_t gcm;  /* ground height under the trunk, cm */
 } Tree;
 
+/* One quality level: horizontal resolution (1 = every column, 2 = every other column, each drawn
+   two pixels wide) and how far rays travel. The adaptive controller moves between these. */
 typedef struct {
 	int colStep;
 	float maxDist;
@@ -31,13 +53,23 @@ static const QLevel QL[QUALITY_LEVELS] = {
 	{2, 45.0f}, {2, 70.0f}, {2, 100.0f}, {1, 60.0f}, {1, 85.0f}, {1, 110.0f},
 };
 
-static TCell* g_cells;
-static int g_n;
+static TCell* g_cells;       /* g_n * g_n cells, row major */
+static uint8_t* g_flags;     /* F_* bits per cell, same indexing as g_cells */
+static int g_n;              /* cells per side */
+static int g_lo, g_hi;       /* editable cell index range, inclusive (inside the tree band) */
 static Tree g_trees[MAX_TREES];
 static int g_ntrees;
-static uint8_t g_thr[64];
+static uint8_t g_thr[64];    /* 8x8 ordered-dither thresholds, row major, scaled to 0..255 */
 static uint32_t g_seed;
 
+static int g_slump;                          /* slumping enabled */
+static uint32_t g_queue[SLUMP_QUEUE_CAP];    /* ring buffer of cell indices */
+static int g_qhead, g_qcount;
+static uint32_t g_shadeList[SHADE_LIST_CAP]; /* unique cells whose lighting is stale */
+static int g_nshade;
+static float g_gradeResid;                   /* rounding remainder carried between grade steps */
+
+/* Adaptive quality state. */
 static int g_q = 1;
 static int g_manualQ;
 static float g_avgMs = 16.0f;
@@ -45,16 +77,25 @@ static int g_upCount;
 static int g_failLevel = -1;
 static int g_failTimer;
 
-static float s_T[MAXSTEPS];
-static float s_INV[MAXSTEPS];
-static uint8_t s_fog[MAXSTEPS];
+/* Per-quality ray step table, rebuilt whenever the quality changes. */
+static float s_T[MAXSTEPS];       /* distance of each step */
+static float s_INV[MAXSTEPS];     /* FOCAL / (distance in cm): converts a height difference to pixels */
+static uint8_t s_fog[MAXSTEPS];   /* fog amount 0..255 at each step */
 static int s_steps;
-static int s_nearSteps;
+static int s_nearSteps;           /* steps that still use bilinear height */
 static int s_builtQ = -1;
+/* For every drawn column and step, the screen row the ground occluded down to at that step.
+   Trees use it to clip themselves behind nearer terrain. */
 static uint8_t s_hist[SCREEN_W * MAXSTEPS];
 
+/* Direction towards the sun, used for the baked slope lighting. */
 static const float LIGHT_X = -0.45f, LIGHT_Y = 0.35f, LIGHT_Z = 0.82f;
 
+/* ------------------------------------------------------------------------------------------ */
+/* 2. Helpers                                                                                  */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Cheap integer hash used for deterministic noise and tree placement. */
 static uint32_t hash2(int x, int y, uint32_t s)
 {
 	uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u + s * 2246822519u;
@@ -62,13 +103,14 @@ static uint32_t hash2(int x, int y, uint32_t s)
 	return h ^ (h >> 16);
 }
 
+/* Smooth value noise in 0..1; period is the feature size in cells. */
 static float vnoise(float x, float y, float period, uint32_t seed)
 {
 	x /= period;
 	y /= period;
 	int ix = (int)floorf(x), iy = (int)floorf(y);
 	float tx = x - (float)ix, ty = y - (float)iy;
-	tx = tx * tx * (3.0f - 2.0f * tx);
+	tx = tx * tx * (3.0f - 2.0f * tx); /* smoothstep so cell borders blend without creases */
 	ty = ty * ty * (3.0f - 2.0f * ty);
 	float a = (float)(hash2(ix, iy, seed) & 0xFFFF) / 65535.0f;
 	float b = (float)(hash2(ix + 1, iy, seed) & 0xFFFF) / 65535.0f;
@@ -77,6 +119,8 @@ static float vnoise(float x, float y, float period, uint32_t seed)
 	return (a + (b - a) * tx) * (1.0f - ty) + (c + (d - c) * tx) * ty;
 }
 
+/* 8x8 Bayer matrix. A brightness v (0..255) lights a pixel where v exceeds the threshold, which
+   turns grey levels into the stipple patterns a 1-bit screen can show. */
 static void build_dither(void)
 {
 	static const uint8_t bayer[64] = {
@@ -89,6 +133,9 @@ static void build_dither(void)
 		g_thr[i] = (uint8_t)(bayer[i] * 4 + 2);
 }
 
+/* Recomputes a cell's baked brightness from its material and the slope around it (central
+   differences of the neighbouring heights, Lambert-style against LIGHT_*). Slope contrast is
+   exaggerated so dug holes and piles read clearly in 1-bit. */
 static void shade_cell(int i, int j)
 {
 	int n = g_n;
@@ -118,6 +165,12 @@ static void shade_cell(int i, int j)
 	c->c = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
+/* ------------------------------------------------------------------------------------------ */
+/* 3. Generation                                                                               */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Fills a band TREE_ZONE_M deep along every edge with jittered, randomly thinned trees. Trees
+   are billboards: only a position, size and the ground height under the trunk are kept. */
 static void place_trees(uint32_t seed)
 {
 	const float spacing = 3.0f;
@@ -133,7 +186,7 @@ static void place_trees(uint32_t seed)
 			if (edge > TREE_ZONE_M) continue;
 
 			uint32_t h1 = hash2(gx, gy, seed + 1u), h2 = hash2(gx, gy, seed + 2u), h3 = hash2(gx, gy, seed + 3u);
-			if ((h1 & 15) == 0) continue;
+			if ((h1 & 15) == 0) continue; /* leave an occasional gap */
 			if (g_ntrees >= MAX_TREES) return;
 			Tree* t = &g_trees[g_ntrees++];
 			t->x = cx + ((float)(h1 >> 8 & 255) / 255.0f - 0.5f) * 2.4f;
@@ -150,10 +203,20 @@ int terrain_init(int size, uint32_t seed)
 	terrain_free();
 	build_dither();
 	g_cells = (TCell*)terrain_realloc(NULL, (size_t)size * (size_t)size * sizeof(TCell));
-	if (!g_cells) return 0;
+	g_flags = (uint8_t*)terrain_realloc(NULL, (size_t)size * (size_t)size);
+	if (!g_cells || !g_flags) {
+		terrain_free();
+		return 0;
+	}
+	memset(g_flags, 0, (size_t)size * (size_t)size);
 	g_n = size;
 	g_seed = seed;
+	g_lo = (int)ceilf(EDIT_MARGIN_M / CELL_M);
+	g_hi = size - 1 - g_lo;
+	g_qhead = g_qcount = g_nshade = 0;
+	g_gradeResid = 0.0f;
 
+	/* two octaves of noise give gentle rolling ground (about +-0.9 m) */
 	for (int j = 0; j < size; j++) {
 		for (int i = 0; i < size; i++) {
 			float n = (vnoise((float)i, (float)j, 22.0f, seed) * 2.0f - 1.0f) * 70.0f
@@ -164,6 +227,7 @@ int terrain_init(int size, uint32_t seed)
 			c->c = 150;
 		}
 	}
+	/* lighting needs every height to exist first, so it is a second pass */
 	for (int j = 0; j < size; j++)
 		for (int i = 0; i < size; i++)
 			shade_cell(i, j);
@@ -176,9 +240,12 @@ int terrain_init(int size, uint32_t seed)
 void terrain_free(void)
 {
 	if (g_cells) terrain_realloc(g_cells, 0);
+	if (g_flags) terrain_realloc(g_flags, 0);
 	g_cells = NULL;
+	g_flags = NULL;
 	g_n = 0;
 	g_ntrees = 0;
+	g_qhead = g_qcount = g_nshade = 0;
 }
 
 int terrain_size(void) { return g_n; }
@@ -196,48 +263,114 @@ float terrain_height(float x, float y)
 	return ((a + (b - a) * tx) * (1.0f - ty) + (c + (d - c) * tx) * ty) * 0.01f;
 }
 
-int terrain_get_quality(void) { return g_q; }
-
-static int edit_allowed(float x, float y)
+double terrain_total_volume(void)
 {
-	float world = terrain_world_size();
-	return x >= TREE_ZONE_M && y >= TREE_ZONE_M && x <= world - TREE_ZONE_M && y <= world - TREE_ZONE_M;
+	double sum = 0.0;
+	for (int k = 0; k < g_n * g_n; k++) sum += g_cells[k].h;
+	return sum * 0.01 * (double)(CELL_M * CELL_M);
 }
 
-static void edit_bounds(float x, float y, float radius, int* i0, int* j0, int* i1, int* j1)
+/* ------------------------------------------------------------------------------------------ */
+/* 4. Editing                                                                                  */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Queues a cell for re-lighting (once - F_SHADE de-duplicates). If the list is full the cell is
+   lit immediately instead so no update is ever lost. */
+static void mark_shade(int i, int j)
+{
+	int idx = j * g_n + i;
+	if (g_flags[idx] & F_SHADE) return;
+	if (g_nshade < SHADE_LIST_CAP) {
+		g_flags[idx] |= F_SHADE;
+		g_shadeList[g_nshade++] = (uint32_t)idx;
+	} else {
+		shade_cell(i, j);
+	}
+}
+
+/* Re-lights every queued cell. Called once at the end of each edit so a cell touched many times
+   in one edit is only lit once. */
+static void flush_shade(void)
+{
+	for (int k = 0; k < g_nshade; k++) {
+		uint32_t idx = g_shadeList[k];
+		shade_cell((int)(idx % (uint32_t)g_n), (int)(idx / (uint32_t)g_n));
+		g_flags[idx] &= (uint8_t)~F_SHADE;
+	}
+	g_nshade = 0;
+}
+
+/* Adds a cell to the slump queue (no-op when slumping is off, the cell is already queued, or the
+   queue is full - a dropped cell simply is not relaxed). */
+static void queue_slump(int i, int j)
+{
+	if (!g_slump || i < g_lo || i > g_hi || j < g_lo || j > g_hi) return;
+	int idx = j * g_n + i;
+	if ((g_flags[idx] & F_QUEUED) || g_qcount >= SLUMP_QUEUE_CAP) return;
+	g_flags[idx] |= F_QUEUED;
+	g_queue[(g_qhead + g_qcount) % SLUMP_QUEUE_CAP] = (uint32_t)idx;
+	g_qcount++;
+}
+
+/* Must be called whenever a cell's height changes. Its lighting (and its neighbours', which read
+   its height) becomes stale, and the cell plus its 4 neighbours may now be too steep. */
+static void cell_changed(int i, int j)
+{
+	for (int dj = -1; dj <= 1; dj++) {
+		for (int di = -1; di <= 1; di++) {
+			int ni = i + di, nj = j + dj;
+			if (ni >= 0 && nj >= 0 && ni < g_n && nj < g_n) mark_shade(ni, nj);
+		}
+	}
+	queue_slump(i, j);
+	queue_slump(i - 1, j);
+	queue_slump(i + 1, j);
+	queue_slump(i, j - 1);
+	queue_slump(i, j + 1);
+}
+
+/* Cell rectangle covering a circle of the given radius, clamped to the editable field.
+   Returns 0 when the circle does not touch any editable cell. */
+static int edit_bounds(float x, float y, float radius, int* i0, int* j0, int* i1, int* j1)
 {
 	*i0 = (int)floorf((x - radius) * (1.0f / CELL_M));
 	*i1 = (int)ceilf((x + radius) * (1.0f / CELL_M));
 	*j0 = (int)floorf((y - radius) * (1.0f / CELL_M));
 	*j1 = (int)ceilf((y + radius) * (1.0f / CELL_M));
-	if (*i0 < 0) *i0 = 0;
-	if (*j0 < 0) *j0 = 0;
-	if (*i1 > g_n - 1) *i1 = g_n - 1;
-	if (*j1 > g_n - 1) *j1 = g_n - 1;
+	if (*i0 < g_lo) *i0 = g_lo;
+	if (*j0 < g_lo) *j0 = g_lo;
+	if (*i1 > g_hi) *i1 = g_hi;
+	if (*j1 > g_hi) *j1 = g_hi;
+	return *i0 <= *i1 && *j0 <= *j1;
 }
 
-/* Lighting depends on neighbouring heights, so reshade one ring beyond the edited area. */
-static void reshade_rect(int i0, int j0, int i1, int j1)
+/* Rock where the ground has been dug down to the bedrock floor, dirt elsewhere. */
+static uint8_t material_for(int h)
 {
-	if (i0 > 0) i0--;
-	if (j0 > 0) j0--;
-	if (i1 < g_n - 1) i1++;
-	if (j1 < g_n - 1) j1++;
-	for (int j = j0; j <= j1; j++)
-		for (int i = i0; i <= i1; i++)
-			shade_cell(i, j);
+	return h <= BEDROCK_CM + 6 ? MAT_ROCK : MAT_DIRT;
 }
 
+/* Sets a cell's height and material after an edit and schedules the follow-up work. */
+static void set_cell(int i, int j, int newH, uint8_t mat)
+{
+	TCell* c = &g_cells[j * g_n + i];
+	c->h = (int16_t)newH;
+	c->m = mat;
+	cell_changed(i, j);
+}
+
+/* Dig: carves a shallow bowl (lowest at the bucket tip, rising 40 cm to the rim) and removes
+   whatever lies above it. If that is more than maxVol the cut is scaled back proportionally so
+   the bucket never takes more than it can hold. Two passes: measure, then apply. */
 float terrain_dig(float x, float y, float tipZ, float radius, float maxVol)
 {
-	if (!g_cells || maxVol <= 0.0f || !edit_allowed(x, y)) return 0.0f;
 	int i0, j0, i1, j1;
-	edit_bounds(x, y, radius, &i0, &j0, &i1, &j1);
+	if (!g_cells || maxVol <= 0.0f || !edit_bounds(x, y, radius, &i0, &j0, &i1, &j1)) return 0.0f;
 	const float r2 = radius * radius;
 	const float tipcm = tipZ * 100.0f;
-	const float cellVol = 0.01f * CELL_M * CELL_M;
+	const float cellVol = 0.01f * CELL_M * CELL_M; /* m^3 per centimeter of height in one cell */
 
-	float total = 0.0f;
+	float total = 0.0f; /* total cm of dirt above the bowl, summed over cells */
 	for (int j = j0; j <= j1; j++) {
 		for (int i = i0; i <= i1; i++) {
 			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
@@ -260,29 +393,29 @@ float terrain_dig(float x, float y, float tipZ, float radius, float maxVol)
 			if (d2 > r2) continue;
 			float t = tipcm + 40.0f * (d2 / r2);
 			if (t < (float)BEDROCK_CM) t = (float)BEDROCK_CM;
-			TCell* c = &g_cells[j * g_n + i];
-			float excess = (float)c->h - t;
+			float excess = (float)g_cells[j * g_n + i].h - t;
 			if (excess <= 0.0f) continue;
 			int rm = (int)(excess * scale + 0.5f);
 			if (rm <= 0) continue;
-			c->h = (int16_t)(c->h - rm);
-			c->m = c->h <= BEDROCK_CM + 6 ? MAT_ROCK : MAT_DIRT;
+			set_cell(i, j, g_cells[j * g_n + i].h - rm, material_for(g_cells[j * g_n + i].h - rm));
 			removedCm += rm;
 		}
 	}
-	reshade_rect(i0, j0, i1, j1);
+	flush_shade();
 	return (float)removedCm * cellVol;
 }
 
+/* Dump: spreads vol over a cone (tallest in the middle) by giving each cell a share proportional
+   to its weight. Cells already at the cap (topZ or MAX_HEIGHT_CM) take nothing, so the returned
+   volume can be less than requested and the caller keeps the remainder in the bucket. */
 float terrain_dump(float x, float y, float topZ, float radius, float vol)
 {
-	if (!g_cells || vol <= 0.0f || !edit_allowed(x, y)) return 0.0f;
 	int i0, j0, i1, j1;
-	edit_bounds(x, y, radius, &i0, &j0, &i1, &j1);
+	if (!g_cells || vol <= 0.0f || !edit_bounds(x, y, radius, &i0, &j0, &i1, &j1)) return 0.0f;
 	const float capcm = topZ * 100.0f < (float)MAX_HEIGHT_CM ? topZ * 100.0f : (float)MAX_HEIGHT_CM;
 	const float cellVol = 0.01f * CELL_M * CELL_M;
 
-	float sumW = 0.0f;
+	float sumW = 0.0f; /* total cone weight over cells that can still receive dirt */
 	for (int j = j0; j <= j1; j++) {
 		for (int i = i0; i <= i1; i++) {
 			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
@@ -299,19 +432,137 @@ float terrain_dump(float x, float y, float topZ, float radius, float vol)
 		for (int i = i0; i <= i1; i++) {
 			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
 			float d = sqrtf(dx * dx + dy * dy);
-			TCell* c = &g_cells[j * g_n + i];
-			if (d >= radius || (float)c->h >= capcm) continue;
+			int h = g_cells[j * g_n + i].h;
+			if (d >= radius || (float)h >= capcm) continue;
 			int add = (int)(cmPerWeight * (1.0f - d / radius) + 0.5f);
-			if ((float)(c->h + add) > capcm) add = (int)(capcm - (float)c->h);
+			if ((float)(h + add) > capcm) add = (int)(capcm - (float)h);
 			if (add <= 0) continue;
-			c->h = (int16_t)(c->h + add);
-			c->m = MAT_DIRT;
+			set_cell(i, j, h + add, MAT_DIRT);
 			addedCm += add;
 		}
 	}
-	reshade_rect(i0, j0, i1, j1);
+	flush_shade();
 	return (float)addedCm * cellVol;
 }
+
+/* Grade blade. Fits a straight line (height against distance u along the heading) through the
+   cells in the rectangle by least squares, then moves each cell a fraction `blend` of the way to
+   that line. Because the line passes through the mean height of the cells, high spots and low
+   spots trade dirt and the total is unchanged (up to centimeter rounding and the clamps below).
+   The slope is clamped to GRADE_MAX_SLOPE; the line is level across the heading so ramps are
+   flat from side to side. */
+void terrain_grade(float cx, float cy, float yaw, float halfLen, float halfWid, float blend)
+{
+	int i0, j0, i1, j1;
+	if (!g_cells || blend <= 0.0f) return;
+	if (!edit_bounds(cx, cy, halfLen + halfWid, &i0, &j0, &i1, &j1)) return;
+	const float c = cosf(yaw), s = sinf(yaw);
+
+	/* pass 1: accumulate the sums for the regression of h on u */
+	int cnt = 0;
+	float su = 0.0f, sh = 0.0f, suu = 0.0f, suh = 0.0f;
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - cx, dy = (float)j * CELL_M - cy;
+			float u = dx * c + dy * s;   /* along the heading */
+			float v = -dx * s + dy * c;  /* across it */
+			if (fabsf(u) > halfLen || fabsf(v) > halfWid) continue;
+			float h = (float)g_cells[j * g_n + i].h;
+			cnt++;
+			su += u;
+			sh += h;
+			suu += u * u;
+			suh += u * h;
+		}
+	}
+	if (cnt < 4) return;
+
+	const float meanU = su / (float)cnt, meanH = sh / (float)cnt;
+	const float varU = suu - (float)cnt * meanU * meanU;
+	const float covUH = suh - (float)cnt * meanU * meanH;
+	float slope = varU > 1e-3f ? covUH / varU : 0.0f; /* cm of height per meter along heading */
+	const float maxSlope = GRADE_MAX_SLOPE * 100.0f;
+	if (slope > maxSlope) slope = maxSlope;
+	if (slope < -maxSlope) slope = -maxSlope;
+
+	/* pass 2: ease every cell towards the target line. Heights are whole centimeters, so each
+	   step is rounded; the rounding remainder is carried to the next cell (error diffusion,
+	   persisted between calls) so tiny per-cell steps still add up and the net change in dirt
+	   stays within half a centimeter instead of drifting. */
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - cx, dy = (float)j * CELL_M - cy;
+			float u = dx * c + dy * s;
+			float v = -dx * s + dy * c;
+			if (fabsf(u) > halfLen || fabsf(v) > halfWid) continue;
+			int h = g_cells[j * g_n + i].h;
+			float target = meanH + slope * (u - meanU);
+			if (target < (float)BEDROCK_CM) target = (float)BEDROCK_CM;
+			if (target > (float)MAX_HEIGHT_CM) target = (float)MAX_HEIGHT_CM;
+			float want = (target - (float)h) * blend + g_gradeResid;
+			int step = (int)lrintf(want);
+			g_gradeResid = want - (float)step;
+			if (step != 0) set_cell(i, j, h + step, step > 0 ? MAT_DIRT : material_for(h + step));
+		}
+	}
+	flush_shade();
+}
+
+void terrain_set_slumping(int enabled)
+{
+	g_slump = enabled != 0;
+	if (!g_slump) {
+		/* drop pending work so a later re-enable starts clean */
+		while (g_qcount > 0) {
+			g_flags[g_queue[g_qhead]] &= (uint8_t)~F_QUEUED;
+			g_qhead = (g_qhead + 1) % SLUMP_QUEUE_CAP;
+			g_qcount--;
+		}
+	}
+}
+
+int terrain_get_slumping(void) { return g_slump; }
+
+/* Angle-of-repose relaxation. Pops up to `budget` cells; for each of its 4 neighbours that is
+   more than REPOSE_CM lower, moves just enough dirt across to bring the pair back within the
+   limit. Moving dirt between two cells conserves the total. Changed cells are re-queued, so a
+   collapse keeps spreading over the following calls until the slope is stable. */
+int terrain_slump_step(int budget)
+{
+	static const int dI[4] = { 1, -1, 0, 0 };
+	static const int dJ[4] = { 0, 0, 1, -1 };
+	int moved = 0;
+	if (!g_slump || !g_cells) return 0;
+
+	while (budget-- > 0 && g_qcount > 0) {
+		uint32_t idx = g_queue[g_qhead];
+		g_qhead = (g_qhead + 1) % SLUMP_QUEUE_CAP;
+		g_qcount--;
+		g_flags[idx] &= (uint8_t)~F_QUEUED;
+
+		int i = (int)(idx % (uint32_t)g_n), j = (int)(idx / (uint32_t)g_n);
+		for (int k = 0; k < 4; k++) {
+			int ni = i + dI[k], nj = j + dJ[k];
+			if (ni < g_lo || ni > g_hi || nj < g_lo || nj > g_hi) continue;
+			TCell* from = &g_cells[idx];
+			TCell* to = &g_cells[nj * g_n + ni];
+			int diff = from->h - to->h;
+			if (diff <= REPOSE_CM) continue;
+			int mv = (diff - REPOSE_CM + 1) / 2; /* ceil: leaves the pair at or inside the limit */
+			set_cell(i, j, from->h - mv, material_for(from->h - mv));
+			set_cell(ni, nj, to->h + mv, MAT_DIRT);
+			moved++;
+		}
+	}
+	flush_shade();
+	return moved;
+}
+
+/* ------------------------------------------------------------------------------------------ */
+/* 5. Adaptive quality                                                                         */
+/* ------------------------------------------------------------------------------------------ */
+
+int terrain_get_quality(void) { return g_q; }
 
 void terrain_set_quality(int level)
 {
@@ -323,6 +574,9 @@ void terrain_set_quality(int level)
 	g_q = level >= QUALITY_LEVELS ? QUALITY_LEVELS - 1 : level;
 }
 
+/* Smooths the measured cost, drops a level quickly when it is over budget and raises one slowly
+   when there is headroom. After a drop, the level that failed is not retried for ~20 s so the
+   controller does not oscillate at the edge of what the device can do. */
 int terrain_adapt(float render_ms)
 {
 	if (g_manualQ) return g_q;
@@ -348,6 +602,12 @@ int terrain_adapt(float render_ms)
 	return g_q;
 }
 
+/* ------------------------------------------------------------------------------------------ */
+/* 6. Renderer                                                                                 */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Builds the table of ray distances for the current quality. Step size grows with distance
+   (distant detail is small on screen anyway). Fog is quadratic in distance. */
 static void build_steps(void)
 {
 	const QLevel* q = &QL[g_q];
@@ -368,6 +628,8 @@ static void build_steps(void)
 	s_builtQ = g_q;
 }
 
+/* Draws a vertical run of pixels [y0, y1) in column x (and x+1 when step == 2) at brightness v,
+   dithered with the Bayer matrix. Writes straight into the 1-bit frame buffer. */
 static inline void draw_span(uint8_t* fb, int x, int y0, int y1, int v, int step)
 {
 	uint8_t* p = fb + y0 * ROW_BYTES + (x >> 3);
@@ -390,6 +652,8 @@ static inline void draw_span(uint8_t* fb, int x, int y0, int y1, int v, int step
 	}
 }
 
+/* Sky gradient above the horizon: brightest at the horizon, darkening upwards. hor is the
+   horizon row for this column (it moves with pitch and roll). */
 static inline void draw_sky(uint8_t* fb, int x, int y1, int hor, int step)
 {
 	uint8_t* p = fb + (x >> 3);
@@ -413,19 +677,24 @@ typedef struct {
 	int i;
 } VisTree;
 
+/* qsort comparator: farthest tree first (painter's algorithm). */
 static int vis_cmp(const void* a, const void* b)
 {
 	float da = ((const VisTree*)a)->d, db = ((const VisTree*)b)->d;
 	return da < db ? 1 : (da > db ? -1 : 0);
 }
 
+/* Per-frame camera values shared with the tree drawing code. */
 typedef struct {
-	float cx, cy, camcm;
-	float fx, fy, rx, ry;
-	float horBase, rollK;
-	int step;
+	float cx, cy, camcm;     /* camera position; height in cm */
+	float fx, fy, rx, ry;    /* forward and right unit vectors on the ground plane */
+	float horBase, rollK;    /* horizon row at screen centre, and its slope per pixel (roll) */
+	int step;                /* column step of the current quality level */
 } View;
 
+/* Draws one pixel column of one tree: a three-tier conifer canopy over a thin trunk, shaded by
+   horizontal offset, fogged by distance, and clipped to the ground that was drawn in front of it
+   (si indexes the ray step nearest the tree, s_hist gives that column's occlusion row). */
 static void draw_tree_column(uint8_t* fb, const View* vw, const Tree* tr, float d, float sx, float hwpx, int x, int si)
 {
 	int hc = x & ~(vw->step - 1);
@@ -479,6 +748,7 @@ static void draw_tree_column(uint8_t* fb, const View* vw, const Tree* tr, float 
 	}
 }
 
+/* Collects trees in view, sorts them far to near and draws them column by column. */
 static void draw_trees(uint8_t* fb, const View* vw, float maxDist)
 {
 	static VisTree vis[MAX_VISIBLE];
@@ -501,6 +771,7 @@ static void draw_trees(uint8_t* fb, const View* vw, float maxDist)
 	for (int k = 0; k < nv; k++) {
 		const Tree* t = &g_trees[vis[k].i];
 		float d = vis[k].d;
+		/* binary search for the ray step at the tree's distance */
 		int lo = 0, hi = s_steps;
 		while (lo < hi) {
 			int mid = (lo + hi) >> 1;
@@ -520,6 +791,10 @@ static void draw_trees(uint8_t* fb, const View* vw, float maxDist)
 	}
 }
 
+/* Voxel-space rendering. For every screen column a ray marches outward over the terrain from
+   near to far. At each step the ground height is projected to a screen row; whenever that row is
+   above everything drawn so far (ybuf), the newly visible slice of ground is filled in. Pitch
+   moves the horizon row, roll shears it across the screen. Then trees are drawn over the top. */
 void terrain_render(uint8_t* fb, const float cam[6])
 {
 	if (!g_cells) return;
@@ -547,9 +822,9 @@ void terrain_render(uint8_t* fb, const float cam[6])
 	for (int col = 0; col < SCREEN_W; col += step) {
 		float xc = (float)col + (float)step * 0.5f - SCREEN_W * 0.5f;
 		float u = xc * invFocal;
-		float dx = vw.fx + vw.rx * u, dy = vw.fy + vw.ry * u;
-		float hor = vw.horBase - vw.rollK * xc;
-		int ybuf = SCREEN_H;
+		float dx = vw.fx + vw.rx * u, dy = vw.fy + vw.ry * u; /* ray direction for this column */
+		float hor = vw.horBase - vw.rollK * xc;               /* horizon row for this column */
+		int ybuf = SCREEN_H;                                   /* lowest row not yet covered */
 		uint8_t* hist = &s_hist[col * MAXSTEPS];
 
 		int i;
@@ -572,6 +847,7 @@ void terrain_render(uint8_t* fb, const float cam[6])
 					hcm = (float)p->h;
 				}
 			} else {
+				/* outside the field: flat, lightly speckled ground */
 				hcm = 0.0f;
 				c = 135 + (int)(hash2((int)fxx, (int)fyy, 3u) & 15);
 			}
@@ -583,6 +859,7 @@ void terrain_render(uint8_t* fb, const float cam[6])
 				draw_span(fb, col, y0, ybuf, v, step);
 				ybuf = y0;
 				if (ybuf <= 0) {
+					/* column is full; later steps are fully occluded for tree clipping */
 					if (recordHist && i + 1 < s_steps) memset(&hist[i + 1], 0, (size_t)(s_steps - i - 1));
 					break;
 				}
