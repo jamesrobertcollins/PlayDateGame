@@ -2,13 +2,21 @@
 --
 -- The cab frame and dashboard HUD drawn over the 3D view: window pillars, speed, the active
 -- crank joint, the blade indicator, a tilt gauge with a tipping warning, the render quality and
--- frame rate (handy while tuning for the device), and the "tipped over" prompt.
+-- frame rate (handy while tuning for the device), short notices, and the "tipped over" prompt.
 
 local gfx <const> = playdate.graphics
 
 Cab = {}
 
 local DASH_Y = 212 -- top of the dashboard strip
+
+local noticeText, noticeUntil = nil, 0
+
+-- Shows a short message at the top of the view for a couple of seconds (radio and arm changes).
+function Cab.notify(text)
+	noticeText = text
+	noticeUntil = playdate.getCurrentTimeMilliseconds() + 2500
+end
 
 -- Artificial-horizon style gauge: a line that rotates with roll and shifts with pitch.
 local function drawTiltGauge(cx, cy, ex)
@@ -45,6 +53,14 @@ function Cab.draw(ex, arm, blade)
 
 	drawTiltGauge(200, DASH_Y + 14, ex)
 
+	-- transient notice (radio station, arm scheme)
+	if noticeText and playdate.getCurrentTimeMilliseconds() < noticeUntil then
+		gfx.setColor(gfx.kColorBlack)
+		gfx.fillRoundRect(110, 14, 180, 24, 6)
+		gfx.setImageDrawMode(gfx.kDrawModeFillWhite)
+		gfx.drawTextAligned(noticeText, 200, 19, kTextAlignment.center)
+		gfx.setImageDrawMode(gfx.kDrawModeCopy)
+	end
 	-- blinking warning as the machine nears its tipping angle
 	if not ex.tipped and ex:tiltRatio() > Excavator.WARN_FRACTION then
 		if (playdate.getCurrentTimeMilliseconds() // 250) % 2 == 0 then

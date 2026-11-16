@@ -2,9 +2,9 @@
 
 A first-person excavator sandbox for the [Playdate](https://play.date). Sit in the cab, drive across an open grass field ringed by trees, and dig, dump and grade the ground: carve a hole, pile a hill, and shape ramps you can drive up and down.
 
-![status](https://img.shields.io/badge/status-phase%203%20of%204-yellow)
+![status](https://img.shields.io/badge/status-phase%204%20of%204-green)
 
-> Status: playable in the simulator. Phases 1-3 (renderer and driving, arm and digging, grade blade and slumping) are done. Phase 4 (full menu, saving, radio) is next. See [Roadmap](#roadmap). It has not yet been tuned on real hardware.
+> Status: all four planned phases are done and it is playable in the simulator. It has not yet been tuned on real hardware. See [Roadmap](#roadmap).
 
 ## Controls
 
@@ -18,16 +18,38 @@ A first-person excavator sandbox for the [Playdate](https://play.date). Sit in t
 | **B (hold)** | Lower the grade blade at the front of the tracks (see below) |
 | **B (tap)** | In the *Joints* arm scheme, switch the joint the crank controls (boom or stick) |
 | **B** after tipping | Reset the machine to the middle of the field |
-| **Menu button** | Arm scheme and slumping options (below) |
+| **Menu button** | Radio, Arm and Settings (below) |
 
 A "tap" is a press shorter than 0.25 s; anything longer is a "hold".
 
-### Menu options
+### Menu
+
+The Playdate allows only three custom system-menu items, so the game uses them like this:
 
 | Item | Values | Effect |
 |---|---|---|
+| **Radio** | Off, the built-in stations, then any of your own files | Changes the cab radio. A short notice shows the station. |
 | **Arm** | Arc / Joints | *Arc*: the crank drives boom and stick together along a preset digging arc. *Joints*: the crank drives one joint at a time, switched with a B tap (the dashboard shows which). |
-| **Slumping** | on / off | When on, steep dirt slowly relaxes to a natural angle (about 33 degrees). Turn it off for vertical-walled trenches. |
+| **Settings** | opens a panel | See below. |
+
+The **Settings** panel (Up/Down to choose a row, A to act, B to go back):
+
+| Row | Effect |
+|---|---|
+| **Terrain size** | Left/Right pick 128, 256 or 512 cells per side (a 64, 128 or 256 m field), A applies. Changing the size starts a new, untouched field. |
+| **Slumping** | On: steep dirt slowly relaxes to a natural angle (about 33 degrees). Off: dirt stays exactly where you put it, so you can cut vertical-walled trenches. |
+| **Reset position** | Puts the machine back in the middle of the field (the ground is kept). |
+| **Reset terrain** | Erases all digging. Press A twice to confirm. |
+
+### Saving
+
+Everything is saved automatically: when you open the Menu, exit the game, or the device goes to sleep, and right after a terrain reset or size change. It restores the terrain edits, the machine's position, and the radio, arm, slumping and size settings. The files live in the game's Data folder (`terrain.bin` and `settings.json`). Only your edits are stored, so the terrain file is small (an edited field is typically well under 20 KB, an untouched one is about 100 bytes).
+
+### Radio
+
+- **Built-in stations:** *Gravel FM* (bright chiptune), *Hardhat Country* (boom-chick two-step) and *Night Shift* (slow, moody). They are original tunes written for this game as note data in [Source/radiodata.lua](Source/radiodata.lua) and played by the Playdate's synth sequencer.
+- **Your own music:** any `.mp3` or `.pda` file in `Source/radio/` becomes a station named after the file (`.wav` and `.aiff` files there are converted to `.pda` when the game is built). You can also copy `.mp3` or `.pda` files into the game's `Data/com.playdategame.excavator/radio/` folder without rebuilding. The folder is read when the game starts. Only use audio you have the right to use.
+- **Machine sounds:** the engine's pitch and loudness follow how hard you are working, and digging, spilling dirt, the blade and tipping over each make a sound. They play on top of the radio.
 
 ## How to play
 
@@ -45,11 +67,12 @@ Requirements (Windows):
 - [MSYS2](https://www.msys2.org) with the mingw64 toolchain:
   `pacman -S make mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja mingw-w64-x86_64-arm-none-eabi-gcc mingw-w64-x86_64-arm-none-eabi-newlib`
 - Python with Pillow (only for the host test frame converter)
+- Optional: a standalone Lua interpreter for the radio data test (`pacman -S mingw-w64-x86_64-lua`)
 
 ```powershell
 .\build.ps1              # simulator + device packages
 .\build.ps1 -SimOnly -Run   # simulator only, then launch it
-.\build.ps1 -HostTest    # run the terrain test suite
+.\build.ps1 -HostTest    # run the terrain and radio test suites
 ```
 
 Outputs:
@@ -63,17 +86,23 @@ Both are build products and are git-ignored.
 
 ```
 Source/            Lua game code and the pdxinfo metadata (this folder becomes the .pdx)
-  main.lua         entry point: setup, system menu, per-frame loop
+  main.lua         entry point: loading and saving, system menu, per-frame loop
   excavator.lua    body: driving, terrain following, tilt, slope limits, tipping
   arm.lua          arm: crank/button input, kinematics, digging, dumping, arm drawing
   blade.lua        grade blade (B hold)
   view.lua         camera projection that matches the C renderer (for the arm overlay)
-  cab.lua          cab frame and dashboard HUD
+  cab.lua          cab frame, dashboard HUD and short notices
+  settings.lua     the in-game Settings panel (terrain size, slumping, resets)
+  radio.lua        the cab radio: built-in synth stations and your own audio files
+  radiodata.lua    song data and the small note notation (plain Lua, testable on a PC)
+  sfx.lua          engine and effect sounds
+  radio/           drop-in folder for your own .mp3 / .pda stations
 src/               C extension (compiled into pdex.dll / pdex.bin)
-  terrain.h/.c     heightfield terrain: generation, dig/dump/grade/slump, renderer
+  terrain.h/.c     heightfield terrain: generation, dig/dump/grade/slump, save/load, renderer
   main.c           entry point and the Lua-callable `terrain` API
 tools/
   hosttest.c       host-side test harness for the terrain core
+  radiotest.lua    host-side checks of the radio song data
   raw2png.py       converts the harness's raw 1-bit frames to PNG
 CMakeLists.txt     CMake project (used through build.ps1)
 build.ps1          build and test script
@@ -122,8 +151,12 @@ The tracks are a rectangle whose four corners sample the ground. The average giv
 - edits can't reach the tree band
 - slumping obeys the angle of repose, conserves dirt exactly, and does nothing when off
 - the grade blade conserves dirt, produces a ramp within the excavator's climb limit, and is level side to side
+- saving and loading: the save is small, a save/load/save round trip is byte-identical, and stale (other size or seed), truncated, corrupt or missing files fall back to a clean field
+- all three terrain sizes generate and can be dug
 
-It also renders sample frames to `build/*.png` for a visual check and prints host render timings (which say nothing about device speed).
+It also renders sample frames to `build/*.png` for a visual check and prints host render timings (which say nothing about device speed). If a `lua` interpreter is on the PATH it also runs `tools/radiotest.lua`, which checks that every station parses, uses defined voices, loops over whole bars and stays in a sensible note range.
+
+The Lua game code itself (menus, saving, radio playback, sounds) is checked by running it in the Playdate Simulator.
 
 ## Performance and tuning
 
@@ -139,12 +172,15 @@ Other tunable constants live at the top of each file: machine speed, slope limit
 - The arm is drawn over the scene, so a bucket below ground level still appears in front of it.
 - The bucket is a simple box and the cab is a plain frame.
 - Piles can look spiky with slumping off.
-- With slumping on you can't keep a deep narrow hole open, since the walls collapse to a stable angle (turn slumping off from the menu for trenches).
-- The field size is fixed at 256 cells for now, and nothing is saved between sessions yet.
+- With slumping on you can't keep a deep narrow hole open, since the walls collapse to a stable angle (turn slumping off in Settings for trenches).
+- Radio stations from your own files are found when the game starts, so add them before launching. The menu list is fixed after that.
+- A 512 cell field is the heaviest option. Its memory use is fine, but how well it runs on a real device is untested.
+- The synth stations and machine sounds have been confirmed to start without errors in the simulator but have not been listened to critically or tuned.
 
 ## Roadmap
 
 - [x] **Phase 1:** terrain renderer and driving
 - [x] **Phase 2:** arm, dig and dump with limited bucket load
 - [x] **Phase 3:** grade blade, ramps, optional slumping
-- [ ] **Phase 4:** full system menu (reset terrain, reset position, terrain size 128/256/512, radio station), auto-save of terrain and position, and the cab radio (built-in original synth stations plus a drop-in folder for your own audio)
+- [x] **Phase 4:** system menu and settings (terrain size, resets, slumping, arm scheme, radio station), auto-save of terrain and position, and the cab radio
+- [ ] Next: tune on real hardware, occlude the arm against the ground, a nicer bucket and cab

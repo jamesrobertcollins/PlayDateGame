@@ -62,6 +62,27 @@ float terrain_height(float x, float y);
 /* Sum of all cell heights as a volume in m^3. A diagnostic used to check that edits conserve dirt. */
 double terrain_total_volume(void);
 
+/* ---- Persistence ----
+   Only the edits are stored, as run-length encoded differences from the generated field (see
+   terrain.c), so the file is tiny unless the whole field has been reshaped. The terrain code does
+   no file I/O itself: the caller supplies a sink / source, which keeps it testable on the host. */
+
+/* Receives a chunk of the save file. Return 1 on success, 0 on failure. */
+typedef int (*TerrainSink)(void* ctx, const void* data, size_t len);
+/* Fills buf with up to len bytes of the save file. Return the byte count, 0 at end, <0 on error. */
+typedef int (*TerrainSource)(void* ctx, void* buf, size_t len);
+
+/* Writes the current ground. Clears the dirty flag on success. Returns 1 on success. */
+int terrain_save(TerrainSink sink, void* ctx);
+
+/* Builds a size x size field for `seed` and applies the saved edits on top. Returns 1 if a save
+   was applied. Returns 0 if the data is missing, truncated, or was made for another size or seed;
+   in every case the terrain is left as a valid field (a fresh one on failure). */
+int terrain_load(int size, uint32_t seed, TerrainSource src, void* ctx);
+
+/* True when the ground has changed since the last successful save or load. */
+int terrain_dirty(void);
+
 /* Removes dirt around (x, y) down to a bowl-shaped profile whose lowest point is tipZ,
    never deeper than bedrock and never more than maxVol m^3. Returns the volume removed. */
 float terrain_dig(float x, float y, float tipZ, float radius, float maxVol);

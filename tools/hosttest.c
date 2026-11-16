@@ -20,6 +20,8 @@
 
 static int g_failures;
 
+#define HEADER_BYTES 10 /* size of the save file header written by terrain_save */
+
 #define CHECK(cond, ...)                                  \
 	do {                                                  \
 		if (cond) {                                       \
@@ -198,6 +200,121 @@ static void test_grade(void)
 	dump_frame("host_ramp_after", cam);
 }
 
+/* In-memory save file, standing in for the Playdate file API. */
+typedef struct {
+	uint8_t* data;
+	size_t len, cap, pos;
+} Mem;
+
+static int mem_sink(void* ctx, const void* data, size_t len)
+{
+	Mem* m = (Mem*)ctx;
+	if (m->len + len > m->cap) {
+		m->cap = (m->len + len) * 2;
+		m->data = (uint8_t*)realloc(m->data, m->cap);
+	}
+	memcpy(m->data + m->len, data, len);
+	m->len += len;
+	return 1;
+}
+
+static int mem_source(void* ctx, void* buf, size_t len)
+{
+	Mem* m = (Mem*)ctx;
+	size_t n = m->len - m->pos < len ? m->len - m->pos : len;
+	memcpy(buf, m->data + m->pos, n);
+	m->pos += n;
+	return (int)n;
+}
+
+static void test_persistence(void)
+{
+	printf("saving and loading\n");
+	const int size = 256;
+	const uint32_t seed = 99u;
+	terrain_init(size, seed);
+	terrain_set_slumping(0);
+	float cx = terrain_world_size() * 0.5f, cy = cx;
+
+	/* reshape the field with every kind of edit */
+	for (int k = 0; k < 30; k++) terrain_dig(cx + 5.0f, cy, -5.0f, 0.8f, 100.0f);
+	for (int k = 0; k < 60; k++) terrain_dump(cx - 6.0f, cy + 3.0f, 2.0f, 1.2f, 0.05f);
+	for (float x = cx - 14.0f; x < cx - 6.0f; x += 0.2f) terrain_grade(x + 3.0f, cy + 3.0f, 0.0f, 2.25f, 1.6f, 0.2f);
+	double volume = terrain_total_volume();
+	CHECK(terrain_dirty(), "editing marks the ground dirty");
+
+	Mem a = { 0 };
+	int saved = terrain_save(mem_sink, &a);
+	CHECK(saved && !terrain_dirty(), "save succeeds and clears the dirty flag");
+	CHECK(a.len < 20000, "an edited 256 field saves small (%zu bytes)", a.len);
+
+	terrain_init(size, seed + 1u); /* load must not depend on whatever was there before */
+	int loaded = terrain_load(size, seed, mem_source, &a);
+	a.pos = 0;
+	CHECK(loaded && !terrain_dirty(), "load applies the save and starts clean");
+	CHECK(fabs(terrain_total_volume() - volume) < 1e-9, "loaded ground has exactly the saved volume");
+
+	Mem b = { 0 };
+	terrain_save(mem_sink, &b);
+	CHECK(a.len == b.len && memcmp(a.data, b.data, a.len) == 0, "save, load, save is byte-identical (heights and materials)");
+
+	/* the loaded field still edits normally and saves again */
+	terrain_dig(cx + 5.0f, cy + 4.0f, -1.0f, 0.8f, 1.0f);
+	CHECK(terrain_dirty(), "loaded ground can be edited");
+
+	/* a fresh field's save is a few runs (a run holds at most 65535 cells) */
+	terrain_init(size, seed);
+	Mem c = { 0 };
+	terrain_save(mem_sink, &c);
+	size_t runs = ((size_t)size * (size_t)size + 65534u) / 65535u;
+	CHECK(c.len == HEADER_BYTES + 5 * runs, "an untouched field saves as %zu runs (%zu bytes)", runs, c.len);
+
+	/* stale or damaged files fall back to a clean field of the requested size */
+	terrain_init(size, seed);
+	double fresh = terrain_total_volume();
+	a.pos = 0;
+	CHECK(!terrain_load(size, seed + 7u, mem_source, &a) && terrain_size() == size, "a save for another seed is rejected");
+	a.pos = 0;
+	CHECK(!terrain_load(128, seed, mem_source, &a) && terrain_size() == 128, "a save for another size is rejected");
+
+	terrain_init(size, seed);
+	Mem cut = a;
+	cut.len = a.len / 2;
+	cut.pos = 0;
+	CHECK(!terrain_load(size, seed, mem_source, &cut), "a truncated save is rejected");
+	CHECK(terrain_size() == size && fabs(terrain_total_volume() - fresh) < 1e-9, "...and leaves a clean field");
+
+	Mem bad = { (uint8_t*)malloc(a.len), a.len, a.len, 0 };
+	memcpy(bad.data, a.data, a.len);
+	bad.data[0] = 'Z';
+	CHECK(!terrain_load(size, seed, mem_source, &bad), "a file with the wrong signature is rejected");
+	CHECK(!terrain_load(size, seed, NULL, NULL), "a missing file is handled");
+	CHECK(terrain_size() == size && fabs(terrain_total_volume() - fresh) < 1e-9, "...and leaves a clean field");
+
+	free(a.data);
+	free(b.data);
+	free(c.data);
+	free(bad.data);
+}
+
+static void test_sizes(void)
+{
+	printf("terrain sizes\n");
+	const int sizes[3] = { 128, 256, 512 };
+	for (int s = 0; s < 3; s++) {
+		double t0 = now_ms();
+		int ok = terrain_init(sizes[s], 12345u);
+		double gen = now_ms() - t0;
+		float world = terrain_world_size();
+		/* the machine starts in the middle; make sure it is clear of the edit margin and trees */
+		int roomy = world / 2.0f > EDIT_MARGIN_M + 8.0f;
+		CHECK(ok && roomy, "%d x %d = %.0f m field generates in %.0f ms (host) and has room to work",
+		      sizes[s], sizes[s], (double)world, gen);
+		float v = terrain_dig(world * 0.5f + 5.0f, world * 0.5f, -1.0f, 1.0f, 5.0f);
+		CHECK(v > 0.0f, "...and can be dug");
+	}
+}
+
 int main(int argc, char** argv)
 {
 	int size = argc > 1 ? atoi(argv[1]) : 256;
@@ -211,6 +328,8 @@ int main(int argc, char** argv)
 	test_slump();
 	terrain_init(size, 4242u);
 	test_grade();
+	test_persistence();
+	test_sizes();
 
 	printf("%s (%d failures)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
 	return g_failures ? 1 : 0;

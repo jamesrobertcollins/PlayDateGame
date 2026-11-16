@@ -16,6 +16,9 @@
  *   terrain.grade(cx, cy, yaw, halfLen, halfWid, blend)
  *   terrain.setSlumping(enabled)
  *   terrain.slump(budget)                   -> cells that moved
+ *   terrain.save(path) -> ok                writes the edits to the Data folder
+ *   terrain.load(size, seed, path) -> loaded  always leaves a valid field (fresh if no save)
+ *   terrain.dirty() -> bool                 ground changed since the last save/load
  *   terrain.setQuality(level) / terrain.quality()
  */
 #include <stdint.h>
@@ -111,6 +114,78 @@ static int l_slump(lua_State* L)
 	return 1;
 }
 
+/* ---- Persistence ---------------------------------------------------------------------- */
+
+/* Adapters from the terrain core's sink / source callbacks to the Playdate file API. */
+static int file_sink(void* ctx, const void* data, size_t len)
+{
+	return pd->file->write((SDFile*)ctx, data, (unsigned int)len) == (int)len;
+}
+
+static int file_source(void* ctx, void* buf, size_t len)
+{
+	return pd->file->read((SDFile*)ctx, buf, (unsigned int)len);
+}
+
+/* terrain.save(path) -> ok. Written to a temporary file first and then swapped in, so a crash
+   or power loss mid-save leaves the previous save intact. Files live in the game's Data folder. */
+static int l_save(lua_State* L)
+{
+	(void)L;
+	const char* path = pd->lua->getArgString(1);
+	/* the temp name is built by hand: snprintf would pull the C stdio library into the device
+	   build, which the Playdate does not provide */
+	char tmp[96];
+	size_t plen = strlen(path);
+	if (plen + 5 > sizeof tmp) {
+		pd->lua->pushBool(0);
+		return 1;
+	}
+	memcpy(tmp, path, plen);
+	memcpy(tmp + plen, ".tmp", 5); /* includes the terminating NUL */
+
+	int ok = 0;
+	SDFile* f = pd->file->open(tmp, kFileWrite);
+	if (f) {
+		ok = terrain_save(file_sink, f);
+		ok = pd->file->close(f) == 0 && ok;
+	}
+	if (ok) {
+		pd->file->unlink(path, 0);
+		ok = pd->file->rename(tmp, path) == 0;
+	}
+	if (!ok) pd->system->logToConsole("terrain.save(%s) failed: %s", path, pd->file->geterr());
+	pd->lua->pushBool(ok);
+	return 1;
+}
+
+/* terrain.load(size, seed, path) -> loaded. Always leaves a valid field behind: returns false
+   when there is no usable save, in which case the field is freshly generated. */
+static int l_load(lua_State* L)
+{
+	(void)L;
+	int size = pd->lua->getArgInt(1);
+	int seed = pd->lua->getArgInt(2);
+	const char* path = pd->lua->getArgString(3);
+	if (size < 32) size = 32;
+	if (size > 1024) size = 1024;
+
+	/* kFileReadData reads only the Data folder, where saves are written */
+	SDFile* f = pd->file->open(path, kFileReadData);
+	int loaded = terrain_load(size, (uint32_t)seed, f ? file_source : NULL, f);
+	if (f) pd->file->close(f);
+	pd->lua->pushBool(loaded);
+	return 1;
+}
+
+/* terrain.dirty() -> true if the ground changed since the last save or load */
+static int l_dirty(lua_State* L)
+{
+	(void)L;
+	pd->lua->pushBool(terrain_dirty());
+	return 1;
+}
+
 /* terrain.render(x, y, z, yaw, pitch, roll) - draws into the system frame buffer */
 static int l_render(lua_State* L)
 {
@@ -168,6 +243,9 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		reg(l_grade, "terrain.grade");
 		reg(l_setSlumping, "terrain.setSlumping");
 		reg(l_slump, "terrain.slump");
+		reg(l_save, "terrain.save");
+		reg(l_load, "terrain.load");
+		reg(l_dirty, "terrain.dirty");
 		reg(l_render, "terrain.render");
 		reg(l_setQuality, "terrain.setQuality");
 		reg(l_quality, "terrain.quality");

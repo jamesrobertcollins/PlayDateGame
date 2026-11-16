@@ -33,6 +33,11 @@
 #define SHADE_LIST_CAP 2048   /* cells waiting to be re-lit */
 #define F_QUEUED 1            /* per-cell flag: already in the slump queue */
 #define F_SHADE 2             /* per-cell flag: already in the shade list */
+#define F_MOD 4               /* per-cell flag: edited at some point (saved explicitly) */
+
+#define SAVE_MAGIC "XCV1"     /* file signature + format version */
+#define SAVE_HEADER_BYTES 10  /* magic, u16 size, u32 seed */
+#define SAVE_BUF 1024         /* streaming buffer for save and load */
 
 void* (*terrain_realloc)(void*, size_t) = realloc;
 
@@ -68,6 +73,7 @@ static int g_qhead, g_qcount;
 static uint32_t g_shadeList[SHADE_LIST_CAP]; /* unique cells whose lighting is stale */
 static int g_nshade;
 static float g_gradeResid;                   /* rounding remainder carried between grade steps */
+static int g_dirty;                          /* ground changed since the last save/load */
 
 /* Adaptive quality state. */
 static int g_q = 1;
@@ -198,7 +204,18 @@ static void place_trees(uint32_t seed)
 	}
 }
 
-int terrain_init(int size, uint32_t seed)
+/* Ground height of the untouched field, in centimeters. Two octaves of noise give gentle rolling
+   ground (about +-0.9 m). This is deterministic in (i, j, seed), which is what lets a save file
+   store only the difference from it. */
+static int16_t base_height(int i, int j, uint32_t seed)
+{
+	float n = (vnoise((float)i, (float)j, 22.0f, seed) * 2.0f - 1.0f) * 70.0f
+	        + (vnoise((float)i, (float)j, 7.0f, seed + 9u) * 2.0f - 1.0f) * 16.0f;
+	return (int16_t)n;
+}
+
+/* Allocates the grid and fills it with the untouched field (no lighting, no trees yet). */
+static int generate(int size, uint32_t seed)
 {
 	terrain_free();
 	build_dither();
@@ -216,24 +233,32 @@ int terrain_init(int size, uint32_t seed)
 	g_qhead = g_qcount = g_nshade = 0;
 	g_gradeResid = 0.0f;
 
-	/* two octaves of noise give gentle rolling ground (about +-0.9 m) */
 	for (int j = 0; j < size; j++) {
 		for (int i = 0; i < size; i++) {
-			float n = (vnoise((float)i, (float)j, 22.0f, seed) * 2.0f - 1.0f) * 70.0f
-			        + (vnoise((float)i, (float)j, 7.0f, seed + 9u) * 2.0f - 1.0f) * 16.0f;
 			TCell* c = &g_cells[j * size + i];
-			c->h = (int16_t)n;
+			c->h = base_height(i, j, seed);
 			c->m = MAT_GRASS;
 			c->c = 150;
 		}
 	}
-	/* lighting needs every height to exist first, so it is a second pass */
-	for (int j = 0; j < size; j++)
-		for (int i = 0; i < size; i++)
-			shade_cell(i, j);
+	return 1;
+}
 
+/* Lighting needs every height to exist first, so it is a pass of its own. */
+static void shade_all(void)
+{
+	for (int j = 0; j < g_n; j++)
+		for (int i = 0; i < g_n; i++)
+			shade_cell(i, j);
+}
+
+int terrain_init(int size, uint32_t seed)
+{
+	if (!generate(size, seed)) return 0;
+	shade_all();
 	place_trees(seed);
 	s_builtQ = -1;
+	g_dirty = 1; /* the file on disk (if any) no longer matches */
 	return 1;
 }
 
@@ -269,6 +294,170 @@ double terrain_total_volume(void)
 	for (int k = 0; k < g_n * g_n; k++) sum += g_cells[k].h;
 	return sum * 0.01 * (double)(CELL_M * CELL_M);
 }
+
+/* ------------------------------------------------------------------------------------------ */
+/* 3b. Saving and loading                                                                      */
+/* ------------------------------------------------------------------------------------------ */
+
+/* File format (little endian):
+     "XCV1"  u16 size  u32 seed
+     then run-length records covering the grid in row-major order:
+       u16 count  i16 diff  u8 material
+   `diff` is the cell's height minus the untouched field's height. Cells that were never edited
+   are all diff 0 / grass, so a mostly untouched field is a handful of bytes, and saving only
+   has to recompute the untouched height for cells flagged F_MOD. Loading regenerates the field
+   from the seed and applies the differences on top. */
+
+typedef struct {
+	TerrainSink sink;
+	void* ctx;
+	uint8_t buf[SAVE_BUF];
+	int n;
+	int ok;
+} Out;
+
+static void out_flush(Out* o)
+{
+	if (o->n > 0 && o->ok) o->ok = o->sink(o->ctx, o->buf, (size_t)o->n);
+	o->n = 0;
+}
+
+static void out_bytes(Out* o, const uint8_t* d, int len)
+{
+	for (int k = 0; k < len; k++) {
+		if (o->n == SAVE_BUF) out_flush(o);
+		o->buf[o->n++] = d[k];
+	}
+}
+
+static void out_record(Out* o, int count, int diff, uint8_t mat)
+{
+	uint8_t r[5] = { (uint8_t)(count & 255), (uint8_t)(count >> 8),
+	                 (uint8_t)(diff & 255), (uint8_t)((diff >> 8) & 255), mat };
+	out_bytes(o, r, 5);
+}
+
+int terrain_save(TerrainSink sink, void* ctx)
+{
+	if (!g_cells || !sink) return 0;
+	static Out o; /* static: the buffer is too big for the small device stack */
+	o.sink = sink;
+	o.ctx = ctx;
+	o.n = 0;
+	o.ok = 1;
+
+	uint8_t hdr[SAVE_HEADER_BYTES] = { 'X', 'C', 'V', '1', (uint8_t)(g_n & 255), (uint8_t)(g_n >> 8),
+	                                   (uint8_t)(g_seed & 255), (uint8_t)((g_seed >> 8) & 255),
+	                                   (uint8_t)((g_seed >> 16) & 255), (uint8_t)(g_seed >> 24) };
+	out_bytes(&o, hdr, SAVE_HEADER_BYTES);
+
+	const int total = g_n * g_n;
+	int run = 0, runDiff = 0;
+	uint8_t runMat = MAT_GRASS;
+	for (int k = 0; k < total; k++) {
+		int diff = 0;
+		uint8_t mat = MAT_GRASS;
+		if (g_flags[k] & F_MOD) {
+			diff = g_cells[k].h - base_height(k % g_n, k / g_n, g_seed);
+			mat = g_cells[k].m;
+		}
+		if (run > 0 && diff == runDiff && mat == runMat && run < 65535) {
+			run++;
+		} else {
+			if (run > 0) out_record(&o, run, runDiff, runMat);
+			run = 1;
+			runDiff = diff;
+			runMat = mat;
+		}
+	}
+	if (run > 0) out_record(&o, run, runDiff, runMat);
+	out_flush(&o);
+	if (o.ok) g_dirty = 0;
+	return o.ok;
+}
+
+typedef struct {
+	TerrainSource src;
+	void* ctx;
+	uint8_t buf[SAVE_BUF];
+	int pos, len;
+} In;
+
+/* Reads exactly n bytes through the buffer; returns 0 at end of data. */
+static int in_get(In* in, uint8_t* out, int n)
+{
+	for (int k = 0; k < n; k++) {
+		if (in->pos == in->len) {
+			in->len = (int)in->src(in->ctx, in->buf, SAVE_BUF);
+			in->pos = 0;
+			if (in->len <= 0) {
+				in->len = 0;
+				return 0;
+			}
+		}
+		out[k] = in->buf[in->pos++];
+	}
+	return 1;
+}
+
+static int clamp_cm(int h)
+{
+	return h < BEDROCK_CM ? BEDROCK_CM : (h > MAX_HEIGHT_CM ? MAX_HEIGHT_CM : h);
+}
+
+int terrain_load(int size, uint32_t seed, TerrainSource src, void* ctx)
+{
+	static In in;
+	uint8_t hdr[SAVE_HEADER_BYTES];
+	in.src = src;
+	in.ctx = ctx;
+	in.pos = in.len = 0;
+
+	/* The header is checked before anything is generated, so a missing or stale file costs only
+	   one normal field generation. */
+	int ok = src && in_get(&in, hdr, SAVE_HEADER_BYTES) && memcmp(hdr, SAVE_MAGIC, 4) == 0;
+	if (ok) {
+		int fileSize = hdr[4] | (hdr[5] << 8);
+		uint32_t fileSeed = (uint32_t)hdr[6] | ((uint32_t)hdr[7] << 8) | ((uint32_t)hdr[8] << 16) | ((uint32_t)hdr[9] << 24);
+		ok = fileSize == size && fileSeed == seed;
+	}
+	if (!ok) {
+		terrain_init(size, seed);
+		return 0;
+	}
+
+	if (!generate(size, seed)) return 0;
+	const int total = size * size;
+	int k = 0;
+	while (k < total) {
+		uint8_t r[5];
+		if (!in_get(&in, r, 5)) break;
+		int count = r[0] | (r[1] << 8);
+		int diff = (int16_t)(r[2] | (r[3] << 8));
+		uint8_t mat = r[4];
+		if (count == 0 || k + count > total || mat > MAT_ROCK) break;
+		if (diff != 0 || mat != MAT_GRASS) {
+			for (int e = k; e < k + count; e++) {
+				g_cells[e].h = (int16_t)clamp_cm(g_cells[e].h + diff);
+				g_cells[e].m = mat;
+				g_flags[e] |= F_MOD;
+			}
+		}
+		k += count;
+	}
+	if (k != total) {
+		/* truncated or corrupt: fall back to a clean field rather than a half-loaded one */
+		terrain_init(size, seed);
+		return 0;
+	}
+	shade_all();
+	place_trees(seed);
+	s_builtQ = -1;
+	g_dirty = 0;
+	return 1;
+}
+
+int terrain_dirty(void) { return g_dirty; }
 
 /* ------------------------------------------------------------------------------------------ */
 /* 4. Editing                                                                                  */
@@ -353,9 +542,12 @@ static uint8_t material_for(int h)
 /* Sets a cell's height and material after an edit and schedules the follow-up work. */
 static void set_cell(int i, int j, int newH, uint8_t mat)
 {
-	TCell* c = &g_cells[j * g_n + i];
+	int idx = j * g_n + i;
+	TCell* c = &g_cells[idx];
 	c->h = (int16_t)newH;
 	c->m = mat;
+	g_flags[idx] |= F_MOD; /* the save file must store this cell explicitly */
+	g_dirty = 1;
 	cell_changed(i, j);
 }
 

@@ -51,8 +51,16 @@ end
 -- Puts the machine back in the middle of the field, upright.
 function Excavator:reset()
 	local world = terrain.worldSize()
-	self.x, self.y = world / 2, world / 2
-	self.yaw = 0
+	self:setPose(world / 2, world / 2, 0)
+end
+
+-- Places the machine at (x, y) facing yaw, upright and stopped. Positions outside the drivable
+-- area (for example from a save made on a different field size) are pulled back inside it.
+function Excavator:setPose(x, y, yaw)
+	local world = terrain.worldSize()
+	self.x = math.max(EDGE_MARGIN, math.min(world - EDGE_MARGIN, x))
+	self.y = math.max(EDGE_MARGIN, math.min(world - EDGE_MARGIN, y))
+	self.yaw = yaw
 	self.speed = 0
 	self.tipped = false
 	self.z, self.pitch, self.roll = samplePose(self.x, self.y, self.yaw)

@@ -92,6 +92,7 @@ function Arm:reset()
 	self.clock = 0                         -- seconds, for tap/hold timing and effects
 	self.aDown, self.bDown = 0, 0          -- clock value when A / B were pressed
 	self.prevTip = nil                     -- previous bucket tip position, for continuous digging
+	self.digging, self.spilling = false, false -- this frame's dig / spill events (for sound)
 end
 
 function Arm:setScheme(scheme)
@@ -183,11 +184,16 @@ function Arm:update(dt, ex)
 	local tx, ty, tz = toWorld(ex, tip[1], 0, tip[2])
 	self.tip = { tx, ty, tz }
 
+	-- event flags for this frame, read by the sound effects
+	self.digging, self.spilling = false, false
+
 	if self.dumping then
 		-- spill only once the bucket is tipped far enough, and never more than it holds
 		if self.bucketAngle >= DUMP_THRESHOLD and self.load > 0 then
 			local want = math.min(self.load, DUMP_RATE * dt)
-			self.load -= terrain.dump(tx, ty, tz, DUMP_RADIUS, want)
+			local dropped = terrain.dump(tx, ty, tz, DUMP_RADIUS, want)
+			self.load -= dropped
+			self.spilling = dropped > 0
 			if self.load < 0.001 then self.load = 0 end
 		end
 	elseif self.curl < CURL_CLOSED and self.load < CAPACITY and self.prevTip then
@@ -197,8 +203,10 @@ function Arm:update(dt, ex)
 		local steps = math.max(1, math.ceil(dist / DIG_STEP))
 		for i = 1, steps do
 			local t = i / steps
-			self.load += terrain.dig(px + (tx - px) * t, py + (ty - py) * t, pz + (tz - pz) * t,
+			local dug = terrain.dig(px + (tx - px) * t, py + (ty - py) * t, pz + (tz - pz) * t,
 				DIG_RADIUS, CAPACITY - self.load)
+			self.load += dug
+			if dug > 0 then self.digging = true end
 		end
 	end
 	self.prevTip = { tx, ty, tz }
