@@ -8,6 +8,7 @@ local MAX_SPEED, ACCEL = 3.5, 7.0
 local TURN_RATE = 1.1
 local EYE_HEIGHT = 2.3
 local EYE_FORWARD = 0.5
+local EYE_LEFT = 0.7
 local CAM_PITCH = -0.30
 
 -- Slope rules (radians)
@@ -105,6 +106,7 @@ end
 
 function Excavator:camera()
 	local c, s = math.cos(self.yaw), math.sin(self.yaw)
-	return self.x + c * EYE_FORWARD, self.y + s * EYE_FORWARD, self.vz + EYE_HEIGHT,
-		self.yaw, self.vpitch + CAM_PITCH, self.vroll
+	-- the cab sits left of the arm's centre line, so the arm shows up right of centre
+	return self.x + c * EYE_FORWARD - s * EYE_LEFT, self.y + s * EYE_FORWARD + c * EYE_LEFT,
+		self.vz + EYE_HEIGHT, self.yaw, self.vpitch + CAM_PITCH, self.vroll
 end

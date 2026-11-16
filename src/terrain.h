@@ -10,6 +10,7 @@
 
 #define CELL_M 0.5f          /* world meters per terrain cell */
 #define BEDROCK_CM (-300)    /* undiggable floor, 3 m below the original ground */
+#define MAX_HEIGHT_CM 900    /* tallest hill that can be piled up */
 #define TREE_ZONE_M 8.0f     /* depth of the tree band along each edge */
 
 #define MAT_GRASS 0
@@ -34,6 +35,14 @@ float terrain_world_size(void);
 
 /* Terrain height in meters, bilinear. Outside the field it is 0. */
 float terrain_height(float x, float y);
+
+/* Removes dirt around (x, y) down to a bowl-shaped profile whose lowest point is tipZ,
+   never deeper than bedrock and never more than maxVol m^3. Returns the volume removed. */
+float terrain_dig(float x, float y, float tipZ, float radius, float maxVol);
+
+/* Deposits up to vol m^3 in a cone around (x, y), never raising ground above topZ.
+   Returns the volume actually deposited. */
+float terrain_dump(float x, float y, float topZ, float radius, float vol);
 
 /* cam = {x, y, z, yaw, pitch, roll}; yaw 0 faces +x, positive yaw turns left (towards +y). */
 void terrain_render(uint8_t* frame, const float cam[6]);

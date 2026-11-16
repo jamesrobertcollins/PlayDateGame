@@ -17,7 +17,7 @@ local function drawTiltGauge(cx, cy, ex)
 	gfx.fillCircleAtPoint(cx, cy, 1)
 end
 
-function Cab.draw(ex)
+function Cab.draw(ex, arm)
 	gfx.setColor(gfx.kColorBlack)
 	gfx.fillRect(0, 0, 400, 10)
 	gfx.fillPolygon(0, 0, 26, 0, 12, DASH_Y, 0, DASH_Y)
@@ -28,6 +28,9 @@ function Cab.draw(ex)
 
 	gfx.setImageDrawMode(gfx.kDrawModeFillWhite)
 	gfx.drawText(string.format("%.1f m/s", math.abs(ex.speed)), 20, DASH_Y + 6)
+	if arm.scheme == Arm.SCHEME_JOINTS then
+		gfx.drawText(arm.active == 1 and "Crank: BOOM" or "Crank: STICK", 80, DASH_Y + 6)
+	end
 	gfx.drawText(string.format("Q%d  %dfps", terrain.quality(), playdate.getFPS()), 300, DASH_Y + 6)
 	gfx.setImageDrawMode(gfx.kDrawModeCopy)
 

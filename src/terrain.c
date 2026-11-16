@@ -106,7 +106,7 @@ static void shade_cell(int i, int j)
 	int noise;
 	uint32_t hv = hash2(i, j, 77u);
 	switch (c->m) {
-	case MAT_DIRT: base = 100.0f; noise = (int)(hv & 15) - 8; break;
+	case MAT_DIRT: base = 88.0f; noise = (int)(hv & 15) - 8; break;
 	case MAT_ROCK: base = 72.0f; noise = (int)(hv & 15) - 8; break;
 	default:
 		/* per-cell speckle plus low-frequency patches so open grass isn't a flat tone */
@@ -197,6 +197,121 @@ float terrain_height(float x, float y)
 }
 
 int terrain_get_quality(void) { return g_q; }
+
+static int edit_allowed(float x, float y)
+{
+	float world = terrain_world_size();
+	return x >= TREE_ZONE_M && y >= TREE_ZONE_M && x <= world - TREE_ZONE_M && y <= world - TREE_ZONE_M;
+}
+
+static void edit_bounds(float x, float y, float radius, int* i0, int* j0, int* i1, int* j1)
+{
+	*i0 = (int)floorf((x - radius) * (1.0f / CELL_M));
+	*i1 = (int)ceilf((x + radius) * (1.0f / CELL_M));
+	*j0 = (int)floorf((y - radius) * (1.0f / CELL_M));
+	*j1 = (int)ceilf((y + radius) * (1.0f / CELL_M));
+	if (*i0 < 0) *i0 = 0;
+	if (*j0 < 0) *j0 = 0;
+	if (*i1 > g_n - 1) *i1 = g_n - 1;
+	if (*j1 > g_n - 1) *j1 = g_n - 1;
+}
+
+/* Lighting depends on neighbouring heights, so reshade one ring beyond the edited area. */
+static void reshade_rect(int i0, int j0, int i1, int j1)
+{
+	if (i0 > 0) i0--;
+	if (j0 > 0) j0--;
+	if (i1 < g_n - 1) i1++;
+	if (j1 < g_n - 1) j1++;
+	for (int j = j0; j <= j1; j++)
+		for (int i = i0; i <= i1; i++)
+			shade_cell(i, j);
+}
+
+float terrain_dig(float x, float y, float tipZ, float radius, float maxVol)
+{
+	if (!g_cells || maxVol <= 0.0f || !edit_allowed(x, y)) return 0.0f;
+	int i0, j0, i1, j1;
+	edit_bounds(x, y, radius, &i0, &j0, &i1, &j1);
+	const float r2 = radius * radius;
+	const float tipcm = tipZ * 100.0f;
+	const float cellVol = 0.01f * CELL_M * CELL_M;
+
+	float total = 0.0f;
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
+			float d2 = dx * dx + dy * dy;
+			if (d2 > r2) continue;
+			float t = tipcm + 40.0f * (d2 / r2);
+			if (t < (float)BEDROCK_CM) t = (float)BEDROCK_CM;
+			float excess = (float)g_cells[j * g_n + i].h - t;
+			if (excess > 0.0f) total += excess;
+		}
+	}
+	if (total * cellVol <= 1e-4f) return 0.0f;
+	float scale = total * cellVol > maxVol ? maxVol / (total * cellVol) : 1.0f;
+
+	int removedCm = 0;
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
+			float d2 = dx * dx + dy * dy;
+			if (d2 > r2) continue;
+			float t = tipcm + 40.0f * (d2 / r2);
+			if (t < (float)BEDROCK_CM) t = (float)BEDROCK_CM;
+			TCell* c = &g_cells[j * g_n + i];
+			float excess = (float)c->h - t;
+			if (excess <= 0.0f) continue;
+			int rm = (int)(excess * scale + 0.5f);
+			if (rm <= 0) continue;
+			c->h = (int16_t)(c->h - rm);
+			c->m = c->h <= BEDROCK_CM + 6 ? MAT_ROCK : MAT_DIRT;
+			removedCm += rm;
+		}
+	}
+	reshade_rect(i0, j0, i1, j1);
+	return (float)removedCm * cellVol;
+}
+
+float terrain_dump(float x, float y, float topZ, float radius, float vol)
+{
+	if (!g_cells || vol <= 0.0f || !edit_allowed(x, y)) return 0.0f;
+	int i0, j0, i1, j1;
+	edit_bounds(x, y, radius, &i0, &j0, &i1, &j1);
+	const float capcm = topZ * 100.0f < (float)MAX_HEIGHT_CM ? topZ * 100.0f : (float)MAX_HEIGHT_CM;
+	const float cellVol = 0.01f * CELL_M * CELL_M;
+
+	float sumW = 0.0f;
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
+			float d = sqrtf(dx * dx + dy * dy);
+			if (d >= radius || (float)g_cells[j * g_n + i].h >= capcm) continue;
+			sumW += 1.0f - d / radius;
+		}
+	}
+	if (sumW <= 0.0f) return 0.0f;
+	float cmPerWeight = vol / (cellVol * sumW);
+
+	int addedCm = 0;
+	for (int j = j0; j <= j1; j++) {
+		for (int i = i0; i <= i1; i++) {
+			float dx = (float)i * CELL_M - x, dy = (float)j * CELL_M - y;
+			float d = sqrtf(dx * dx + dy * dy);
+			TCell* c = &g_cells[j * g_n + i];
+			if (d >= radius || (float)c->h >= capcm) continue;
+			int add = (int)(cmPerWeight * (1.0f - d / radius) + 0.5f);
+			if ((float)(c->h + add) > capcm) add = (int)(capcm - (float)c->h);
+			if (add <= 0) continue;
+			c->h = (int16_t)(c->h + add);
+			c->m = MAT_DIRT;
+			addedCm += add;
+		}
+	}
+	reshade_rect(i0, j0, i1, j1);
+	return (float)addedCm * cellVol;
+}
 
 void terrain_set_quality(int level)
 {

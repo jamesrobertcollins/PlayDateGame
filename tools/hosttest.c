@@ -52,5 +52,24 @@ int main(int argc, char** argv)
 	FILE* f = fopen("build/host_trees_hq.raw", "wb");
 	fwrite(frame, 1, sizeof frame, f);
 	fclose(f);
+
+	/* Edit test: dig a pit 6 m ahead of the centre camera, pile the dirt to the right. */
+	float cx = world * 0.5f, cy = world * 0.5f;
+	float dug = 0.0f;
+	for (int k = 0; k < 40; k++) dug += terrain_dig(cx + 6.0f, cy, -5.0f, 0.7f, 100.0f);
+	float dumped = 0.0f, left = dug;
+	for (int k = 0; k < 200 && left > 0.0f; k++) {
+		float d = terrain_dump(cx + 6.0f, cy - 2.5f, 2.0f, 1.2f, left < 0.05f ? left : 0.05f);
+		dumped += d;
+		left -= d;
+	}
+	printf("dug=%.3f m3 dumped=%.3f m3 hole=%.2f m pile=%.2f m\n", dug, dumped,
+	       terrain_height(cx + 6.0f, cy), terrain_height(cx + 6.0f, cy - 2.5f));
+	float cam[6] = {cx, cy, 2.3f, 0.0f, -0.30f, 0.0f};
+	memset(frame, 0, sizeof frame);
+	terrain_render(frame, cam);
+	f = fopen("build/host_edit.raw", "wb");
+	fwrite(frame, 1, sizeof frame, f);
+	fclose(f);
 	return 0;
 }

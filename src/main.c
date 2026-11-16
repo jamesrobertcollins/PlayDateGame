@@ -35,6 +35,26 @@ static int l_height(lua_State* L)
 	return 1;
 }
 
+/* terrain.dig(x, y, tipZ, radius, maxVol) -> volume removed (m^3) */
+static int l_dig(lua_State* L)
+{
+	(void)L;
+	float x = pd->lua->getArgFloat(1), y = pd->lua->getArgFloat(2), z = pd->lua->getArgFloat(3);
+	float r = pd->lua->getArgFloat(4), vol = pd->lua->getArgFloat(5);
+	pd->lua->pushFloat(terrain_dig(x, y, z, r, vol));
+	return 1;
+}
+
+/* terrain.dump(x, y, topZ, radius, vol) -> volume deposited (m^3) */
+static int l_dump(lua_State* L)
+{
+	(void)L;
+	float x = pd->lua->getArgFloat(1), y = pd->lua->getArgFloat(2), z = pd->lua->getArgFloat(3);
+	float r = pd->lua->getArgFloat(4), vol = pd->lua->getArgFloat(5);
+	pd->lua->pushFloat(terrain_dump(x, y, z, r, vol));
+	return 1;
+}
+
 /* terrain.render(x, y, z, yaw, pitch, roll) */
 static int l_render(lua_State* L)
 {
@@ -85,6 +105,8 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		reg(l_init, "terrain.init");
 		reg(l_worldSize, "terrain.worldSize");
 		reg(l_height, "terrain.height");
+		reg(l_dig, "terrain.dig");
+		reg(l_dump, "terrain.dump");
 		reg(l_render, "terrain.render");
 		reg(l_setQuality, "terrain.setQuality");
 		reg(l_quality, "terrain.quality");
